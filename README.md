@@ -1,7 +1,7 @@
 # SQL Server Security Assessment (Community Edition)
 
 Logic & Engine by Andreas Wolter (MCSM)  
-Version 2026.1
+Version 2026.2
 
 ---
 
