@@ -176,7 +176,7 @@ $TrustCert                 = $false
 
 $SqlServer                 = $null
 $Database                  = 'master'
-$SqlFilePath               = Join-Path $ScriptRoot 'SqlSafe_202602.sql'
+$SqlFilePath               = Join-Path $ScriptRoot 'SqlSafe.sql'
 
 $ResultsFolder             = Join-Path $ScriptRoot 'Results'
 if (-not (Test-Path $ResultsFolder)) {
@@ -1120,12 +1120,12 @@ function Invoke-AssessmentSqlcmd {
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms, System.Data
 
 # --- EARLY SQL FILE VALIDATION ---
-$ExpectedSqlFileName = 'SqlSafe_202602.sql'
-$ExpectedSqlHash = '6cb92982cdd1184227be9e290bd2aeb72a7753bd8a5d43a90fc368b4cde52bbf'
+$ExpectedSqlFileName = 'SqlSafe.sql'
+$ExpectedSqlHash = 'd7f4a87f840e8e1ebcecef72105ad4831798a5341a532daf4dfa6fb4b9cd3336'
 
 if ([System.IO.Path]::GetFileName($SqlFilePath) -ne $ExpectedSqlFileName) {
     [System.Windows.MessageBox]::Show(
-        "Unexpected SQL file name detected. Only the original SqlSafe_202602.sql file is permitted. Execution has been stopped.",
+        "Unexpected SQL file name detected. Only the original SqlSafe.sql file is permitted. Execution has been stopped.",
         "SQL Server Security Assessment",
         [System.Windows.MessageBoxButton]::OK,
         [System.Windows.MessageBoxImage]::Error
@@ -1148,7 +1148,7 @@ catch {
 
 if ($ActualSqlHash -ne $ExpectedSqlHash) {
     [System.Windows.MessageBox]::Show(
-        "The SQL script SqlSafe_202602.sql has been modified or replaced. Execution has been stopped. For security reasons, only the original, unmodified version of the security check script may be used.",
+        "The SQL script SqlSafe.sql has been modified or replaced. Execution has been stopped. For security reasons, only the original, unmodified version of the security check script may be used.",
         "SQL Server Security Assessment",
         [System.Windows.MessageBoxButton]::OK,
         [System.Windows.MessageBoxImage]::Error
