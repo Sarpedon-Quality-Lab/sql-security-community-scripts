@@ -1320,8 +1320,8 @@ The assessment found orphaned Windows logins that no longer exist in Active Dire
     '059' = [pscustomobject]@{ CheckName = 'Security Auditing minimal setup'; Recommendation = @'
 Security auditing is insufficiently configured. At a minimum, monitor failed login attempts, permission changes, role membership changes, and other security-relevant activities. Refer to established guidance for a comprehensive set of audit actions to ensure adequate visibility into security events.
 '@.Trim(); ReferenceTitle = 'Recommendation for Security Auditing for databases - with example for Microsoft SQL Server'; ReferenceUrl = 'https://andreas-wolter.com/en/202507_recommended_security_auditing_databases_sql_server/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '069' = [pscustomobject]@{ CheckName = ''; Recommendation = @'
-
+    '069' = [pscustomobject]@{ CheckName = 'Basic Login-Failure logging status'; Recommendation = @'
+    Failed Logins are not Logged in the ErrorLog. Unless they are captured in an Audit, this should always be on.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
 }
 
