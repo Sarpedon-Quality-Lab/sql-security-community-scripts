@@ -1,23 +1,23 @@
-# SQL Server Security Assessment (Community Edition)
+# Get-SqlSafe.ps1: The Sarpedon SQL Server Security Community Assessment
+**Logic & Engine by Andreas Wolter (MCSM)**
 
-Logic \& Engine by Andreas Wolter (MCSM)  
-Version 2026.2
+Version 2026.1
 
 \---
 
 ## What this tool does
 
-SQL Server Security Assessment Community Edition identifies high-level security indicators in SQL Server environments.
+`Get-SqlSafe` is a simple, robust PowerShell script that safely scans your SQL Server environment for 25 core vulnerabilities. It focuses on the instance-level misconfigurations and permission creep that generic tools often miss.
 
-It is designed to:
+## What this tool does
+This Community Edition identifies high-level security indicators in SQL Server environments. It is designed to:
+* Operate under strict least privilege principles (no `sysadmin` rights required where supported).
+* Output a clean, visual HTML report.
+* Be completely transparent and easy to review (plain-text PowerShell and T-SQL).
+* Avoid automatic dependency installation.
 
-* run with least privilege where supported by the SQL Server version
-* be transparent and easy to review
-* use plain-text PowerShell and T-SQL files
-* generate a local HTML report
-* avoid automatic dependency installation
 
-This Community Edition is intended to provide a practical first look at security posture. It does not replace a full security audit or a complete SQL Server security assessment.
+> **Note:** This Community Edition is intended to provide a practical first look at your security posture. It does not replace a full security audit.
 
 \---
 
@@ -301,6 +301,20 @@ Handle generated reports according to your organization's data handling and conf
 * The tool identifies indicators of risk; it does not enforce configuration changes.
 * Some checks may require permissions that are not available on older SQL Server versions without elevated access.
 * Community Edition focuses on high-level indicators and does not represent a complete security audit.
+
+
+\---
+
+## Beyond the Baseline: Need the Complete Picture?
+`Get-SqlSafe.ps1` covers 25 essential baseline checks. However, enterprise environments require deeper architectural scrutiny. 
+
+The full **Sarpedon SQL Server Security Assessment** executes up to **140+ advanced architectural checks**, including:
+* Deep database-level configuration audits
+* OS-level and Backup security reviews
+* Advanced Account Attribution & lateral movement mapping
+
+[Explore Full-Scope Security Assessments at Sarpedon Quality Lab](https://sarpedonqualitylab.us/sql-server-security-assessment/)
+
 
 \---
 
