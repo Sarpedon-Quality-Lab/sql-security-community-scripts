@@ -28,13 +28,13 @@ This Community Edition is designed to:
 3. Unblock the files if they were downloaded from the internet:
 
 ```powershell
-Unblock-File .\\Get-SqlSafe.ps1
+Unblock-File .\Get-SqlSafe.ps1
 ```
 
 4. Run the assessment launcher:
 
 ```powershell
-.\\Get-SqlSafe.ps1
+.\Get-SqlSafe.ps1
 ```
 
 5. Enter your SQL Server connection details.
@@ -44,7 +44,7 @@ Unblock-File .\\Get-SqlSafe.ps1
 If your system blocks script execution, you may run the script with an explicit execution policy for this process:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\\Get-SqlSafe.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\Get-SqlSafe.ps1
 ```
 
 This only allows the script to run in that PowerShell process. It does not unblock files permanently and does not install missing dependencies.
@@ -156,7 +156,7 @@ If the installed module location is not under one of the listed module paths, Po
 Example: if the module was installed under the current user's profile, but the CurrentUser module path is missing from `PSModulePath`, import the module manifest directly:
 
 ```powershell
-Import-Module "C:\\Users\\<user>\\Documents\\WindowsPowerShell\\Modules\\SqlServer\\<version>\\SqlServer.psd1" -Force
+Import-Module "C:\Users\<user>\Documents\WindowsPowerShell\Modules\SqlServer\<version>\SqlServer.psd1" -Force
 Get-Command Invoke-Sqlcmd
 ```
 
@@ -246,15 +246,15 @@ Review the PowerShell and T-SQL files before running them in production or custo
 #### 2\. Verify file integrity
 
 ```powershell
-Get-FileHash .\\Get-SqlSafe.ps1 -Algorithm SHA256
-Get-FileHash .\\SqlSafe.sql -Algorithm SHA256
+Get-FileHash .\Get-SqlSafe.ps1 -Algorithm SHA256
+Get-FileHash .\SqlSafe.sql -Algorithm SHA256
 ```
 
 #### 3\. Unblock downloaded files
 
 ```powershell
-Unblock-File .\\Get-SqlSafe.ps1
-Unblock-File .\\SqlSafe.sql
+Unblock-File .\Get-SqlSafe.ps1
+Unblock-File .\SqlSafe.sql
 ```
 
 #### 4\. Confirm PowerShell dependency
@@ -276,8 +276,8 @@ If your organization enforces `AllSigned`, sign the approved PowerShell file wit
 Example only:
 
 ```powershell
-$cert = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert | Select-Object -First 1
-Set-AuthenticodeSignature -FilePath .\\Get-SqlSafe.ps1 -Certificate $cert
+$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1
+Set-AuthenticodeSignature -FilePath .\Get-SqlSafe.ps1 -Certificate $cert
 ```
 
 Follow your internal process for code review, signing, packaging, and deployment.
