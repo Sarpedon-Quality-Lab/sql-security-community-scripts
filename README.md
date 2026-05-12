@@ -1,7 +1,7 @@
 # Get-SqlSafe.ps1: The Sarpedon SQL Server Security Community Assessment
 **Logic & Engine by Andreas Wolter (MCSM)**
 
-Version 2026.1
+Version 2026.2
 
 \---
 
