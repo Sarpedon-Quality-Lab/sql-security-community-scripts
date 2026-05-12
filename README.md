@@ -7,15 +7,15 @@ Version 2026.2
 
 ## What this tool does
 
-`Get-SqlSafe` is a simple, robust PowerShell script that safely scans your SQL Server environment for 25 core vulnerabilities. It focuses on the instance-level misconfigurations and permission creep that generic tools often miss.
+`Get-SqlSafe` is a simple, robust PowerShell script that safely scans your SQL Server environment for 25 core vulnerabilities and helps identify high-level security posture indicators for SQL Server.
 
-## What this tool does
-This Community Edition identifies high-level security indicators in SQL Server environments. It is designed to:
+This Community Edition is designed to:
 * Operate under strict least privilege principles (no `sysadmin` rights required where supported).
 * Output a clean, visual HTML report.
 * Be completely transparent and easy to review (plain-text PowerShell and T-SQL).
 * Avoid automatic dependency installation.
 
+<img width="900" height="584" alt="SecurityAssessment_CommunityEdition_Screenshots" src="https://github.com/user-attachments/assets/3402a013-3c86-4055-8b99-275048424873" />
 
 > **Note:** This Community Edition is intended to provide a practical first look at your security posture. It does not replace a full security audit.
 
