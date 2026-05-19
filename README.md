@@ -37,6 +37,9 @@ Unblock-File .\Get-SqlSafe.ps1
 .\Get-SqlSafe.ps1
 ```
 
+<img width="450" height="305" alt="202605_Get-SqlSafe_ConnectionDialogue" src="https://github.com/user-attachments/assets/13acaa6d-19d8-48f9-bafb-79f141812660" />
+
+
 5. Enter your SQL Server connection details.
 6. The generated html-Report opens automatically in the default browser.
 7. The report is stored in the `Results` subfolder.
