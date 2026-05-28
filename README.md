@@ -37,6 +37,8 @@ Version 2026.3 is a significant update from the 2026.2 public release:
 * Optional run logging was added.
 * Alternate Windows credential relaunch support was added.
 * The GUI connection test now also checks and displays the permissions of the connected SQL Server principal.
+<img width="500" height="402" alt="image" src="https://github.com/user-attachments/assets/90918bd2-e522-41de-a078-a4b6974556a5" />
+
 * Additional checks and refined rule logic were added, including improved handling for sessions using NTLM.
 
 Upgrade note: if you used an earlier version, replace the previous script package with `Get-SqlSafe.ps1`. The separate `SqlSafe.sql` file should be removed because it is no longer used.
