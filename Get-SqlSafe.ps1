@@ -3222,7 +3222,7 @@ catch {
 [xml]$XAML = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SQL Server Security Assessment - Community Edition (2026.3 preview)" Width="560" Height="320"
+        Title="SQL Server Security Assessment - Community Edition (2026.3)" Width="560" Height="320"
         WindowStartupLocation="CenterScreen" Background="#F4F7F6" ResizeMode="NoResize"
         SizeToContent="Height" MinWidth="560">
     <Grid Margin="12">
