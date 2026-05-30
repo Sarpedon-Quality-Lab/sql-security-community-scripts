@@ -78,6 +78,14 @@ No PowerShell module installation is required for SQL execution in this version.
 
 ---
 
+### Supported Scope and Known Limitations
+
+Get-SqlSafe Community Edition is currently scoped to SQL Server on-premises or SQL Server running in a VM using Windows or SQL authentication.
+
+Microsoft Entra authentication scenarios are not currently supported. In current SQL Server versions, Entra-authenticated sessions expose the session authentication scheme as `NTLM`, which does not accurately describe the authentication protocol. Because Get-SqlSafe uses SQL Server authentication-scheme metadata for NTLM/Kerberos interpretation, authentication-related findings may be misleading for Entra-authenticated sessions.
+
+---
+
 ## Quick Start - GUI Mode
 
 1. Download the repository or release package.
