@@ -484,7 +484,7 @@ The full **Sarpedon SQL Server Security Assessment** can include advanced archit
 
 Logic & Engine by Andreas Wolter (MCSM), Sarpedon Quality Lab.
 
-This project is distributed under the Sarpedon Community License. Use is permitted for internal business or personal purposes. Redistribution, white-labeling, or commercial resale of modified versions or generated reports is restricted by the license terms.
+This project is distributed under the Sarpedon Community License. Use is permitted for internal business or personal purposes. Unmodified generated reports may be shared provided that all branding, attribution, Community Edition designation, and version information remain intact. Redistribution of modified scripts or reports is governed by the license terms.
 
 See [`LICENSE.md`](LICENSE.md) for the full license text. Use the tool only on systems where you have authorization to run security assessment tooling.
 
