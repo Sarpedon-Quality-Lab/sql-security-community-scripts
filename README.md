@@ -27,7 +27,7 @@ This Community Edition is designed to:
 - Support both GUI-based and console-based execution.
 - Support selected checks against SQL Server on Amazon RDS through an explicit compatibility mode.
 
-<!-- Add the updated Get-SqlSafe 2026.4 report screenshot here. -->
+<img width="1287" height="1092" alt="Get-SqlSafe Community Edition security assessment report" src="https://github.com/user-attachments/assets/a645177a-a70b-45b7-8c81-7d6a8e0a5524" />
 
 ---
 
@@ -42,6 +42,9 @@ Version 2026.4 builds on the self-contained 2026.3 collector and adds:
 - Improved availability group handling.
 - A category summary table in the HTML report.
 - A report legend explaining the result labels.
+
+<img width="576" height="419" alt="Connection Dialogue with AWS compatibility mode" src="https://github.com/user-attachments/assets/f75c5418-8708-4a10-b4da-64df193f6a12" />
+
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
 
@@ -117,7 +120,7 @@ Contained availability group metadata is available only when the target SQL Serv
 
 The generated HTML report is written to the `Results` subfolder and opens automatically unless report launch is disabled.
 
-<!-- Add the updated Get-SqlSafe 2026.4 connection and permission-test screenshot here. -->
+<img width="500" height="402" alt="Get-SqlSafe connection and permission test" src="https://github.com/user-attachments/assets/90918bd2-e522-41de-a078-a4b6974556a5" />
 
 If your system blocks script execution, you may run the script with an explicit execution policy for this PowerShell process:
 
