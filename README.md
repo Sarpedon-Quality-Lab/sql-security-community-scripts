@@ -1,49 +1,49 @@
 # Get-SqlSafe.ps1: The Sarpedon SQL Server Security Community Assessment
 
 **Logic & Engine by Andreas Wolter (MCSM)**  
-Version 2026.3
+Version 2026.4
 
-A standalone PowerShell-based SQL Server security assessment collector that gathers high-level security indicators from a SQL Server instance and generates a local HTML report.
+Get-SqlSafe Community Edition is a standalone PowerShell-based SQL Server security assessment collector. It gathers selected high-level security indicators from a SQL Server instance and generates a local HTML report for review and remediation discussions.
 
-> **Note:** This Community Edition identifies indicators of risk. It is not a full security audit, penetration test, compliance assessment, or guarantee of security.
+The Community Edition is designed as a practical first look at SQL Server security posture. It focuses on baseline indicators such as authentication exposure, auditing gaps, excessive privileges, risky configuration settings, orphaned or dependent accounts, and database ownership drift.
+
+> **Note:** This tool identifies indicators of risk. It is not a full security audit, penetration test, compliance assessment, or guarantee of security.
+
+Read the [original public introduction to Get-SqlSafe Community Edition](https://andreas-wolter.com/en/2605_get-sqlsafe_communityedition_sqlserver_security_asssessment_tool/).
 
 ---
 
-## What this tool does
+## What This Tool Does
 
 `Get-SqlSafe.ps1` is a simple, reviewable PowerShell script that helps identify high-level SQL Server security posture indicators. It focuses on common security-relevant areas such as authentication, privileged access, server-level permissions, risky configuration, audit visibility, ownership risks, and orphaned accounts.
 
 This Community Edition is designed to:
 
-* Operate under least privilege principles where supported by the target SQL Server version.
-* Output a clean, visual local HTML report.
-* Be transparent and easy to review as plain-text PowerShell with embedded T-SQL.
-* Avoid automatic dependency installation.
-* Run without the Microsoft `SqlServer` PowerShell module or `Invoke-Sqlcmd`.
-* Support both GUI-based and console-based execution.
+- Operate under least-privilege principles where supported by the target SQL Server version.
+- Output a clean, visual local HTML report.
+- Be transparent and easy to review as plain-text PowerShell with embedded T-SQL.
+- Avoid automatic dependency installation.
+- Run without the Microsoft `SqlServer` PowerShell module or `Invoke-Sqlcmd`.
+- Support both GUI-based and console-based execution.
+- Support selected checks against SQL Server on Amazon RDS through an explicit compatibility mode.
 
-<img width="900" height="584" alt="SecurityAssessment_CommunityEdition_Screenshots" src="https://github.com/user-attachments/assets/3402a013-3c86-4055-8b99-275048424873" />
+<!-- Add the updated Get-SqlSafe 2026.4 report screenshot here. -->
 
 ---
 
-## What Changed in 2026.3
+## What Changed in 2026.4
 
-Version 2026.3 is a significant update from the 2026.2 public release:
+Version 2026.4 builds on the self-contained 2026.3 collector and adds:
 
-* The assessment SQL is now embedded in the PowerShell script, removing the former external file dependency on `SqlSafe.sql`.
-* The `Invoke-Sqlcmd` / Microsoft `SqlServer` PowerShell module dependency was removed.
-* SQL execution now uses .NET `System.Data.SqlClient`.
-* Console mode and optional report launch control were added to better support automation-friendly execution, controlled endpoints, and EDR/XDR-controlled environments where UI prompts or automatic browser launch may be restricted.
-* Optional run logging was added.
-* Alternate Windows credential relaunch support was added.
-* The GUI connection test now also checks and displays the permissions of the connected SQL Server principal.
-<img width="500" height="402" alt="image" src="https://github.com/user-attachments/assets/90918bd2-e522-41de-a078-a4b6974556a5" />
+- AWS RDS compatibility mode through `-AwsRdsCompat` and the GUI checkbox.
+- `AWS managed` labels for selected findings where SQL Server behavior may be controlled by AWS.
+- Check `006` for SQL logins without password policy enforcement.
+- Improved contained availability group reporting in Check `802`, including listener DNS/port details and guidance about the separate contained availability group security context.
+- Improved availability group handling.
+- A category summary table in the HTML report.
+- A report legend explaining the result labels.
 
-* Additional checks and refined rule logic were added, including improved handling for sessions using NTLM.
-
-Upgrade note: if you used an earlier version, replace the previous script package with `Get-SqlSafe.ps1`. The separate `SqlSafe.sql` file should be removed because it is no longer used.
-
-See `CHANGELOG.md` for the public changelog summary.
+See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
 
 ---
 
@@ -51,10 +51,10 @@ See `CHANGELOG.md` for the public changelog summary.
 
 The public Community Edition package contains:
 
-* `Get-SqlSafe.ps1` — standalone PowerShell collector, embedded SQL assessment logic, and report generator
-* `README.md` — usage documentation
-* `CHANGELOG.md` — public release summary
-* `LICENSE.md` — Sarpedon Community License
+- `Get-SqlSafe.ps1` — standalone PowerShell collector, embedded SQL assessment logic, and report generator
+- `README.md` — usage documentation
+- `CHANGELOG.md` — public release history
+- `LICENSE.md` — Sarpedon Community License
 
 Generated reports and logs are written to:
 
@@ -62,27 +62,33 @@ Generated reports and logs are written to:
 .\Results
 ```
 
-The public Community Edition package does not require a separate SQL file.
+The public package does not require a separate SQL file.
 
 ---
 
 ## Requirements
 
-* Windows PowerShell 5.1
-* Windows operating system with .NET Framework support
-* Network access to the target SQL Server instance
-* SQL Server 2012 or newer
-* Permissions sufficient to read the assessed security metadata
+- Windows PowerShell 5.1
+- Windows operating system with .NET Framework support
+- Network access to the target SQL Server instance
+- SQL Server 2016 or newer recommended
+- Permissions sufficient to read the assessed security metadata
 
-No PowerShell module installation is required for SQL execution in this version.
+SQL Server 2012 and SQL Server 2014 may work for selected scenarios, but older versions can require higher privileges for some checks.
+
+No PowerShell module installation is required for SQL execution. The collector uses .NET `System.Data.SqlClient`.
 
 ---
 
-### Supported Scope and Known Limitations
+## Supported Targets and Known Limitations
 
-Get-SqlSafe Community Edition is currently scoped to SQL Server on-premises or SQL Server running in a VM using Windows or SQL authentication.
+Get-SqlSafe Community Edition currently supports SQL Server on-premises, SQL Server running in a virtual machine, and selected assessment scenarios for SQL Server on Amazon RDS. Use Windows or SQL authentication as supported by the target platform.
 
-Microsoft Entra authentication scenarios are not currently supported. In current SQL Server versions, Entra-authenticated sessions expose the session authentication scheme as `NTLM`, which does not accurately describe the authentication protocol. Because Get-SqlSafe uses SQL Server authentication-scheme metadata for NTLM/Kerberos interpretation, authentication-related findings may be misleading for Entra-authenticated sessions.
+For SQL Server on Amazon RDS, explicitly enable `-AwsRdsCompat` or select the corresponding GUI option. This mode adjusts or skips selected checks where AWS controls the underlying SQL Server behavior or restricts access to required metadata.
+
+Microsoft Entra authentication scenarios are not currently supported. In current SQL Server versions, Entra-authenticated sessions can expose the session authentication scheme as `NTLM`, which does not accurately describe the authentication protocol. Because Get-SqlSafe uses SQL Server authentication-scheme metadata for NTLM/Kerberos interpretation, authentication-related findings may be misleading for Entra-authenticated sessions.
+
+Contained availability group metadata is available only when the target SQL Server version exposes the required catalog views. Security-context-dependent checks may need to be run through the contained availability group connection context for complete results.
 
 ---
 
@@ -92,20 +98,26 @@ Microsoft Entra authentication scenarios are not currently supported. In current
 2. Open Windows PowerShell.
 3. Unblock the script if it was downloaded from the internet:
 
-```powershell
-Unblock-File .\Get-SqlSafe.ps1
-```
+   ```powershell
+   Unblock-File .\Get-SqlSafe.ps1
+   ```
 
 4. Run the assessment:
 
-```powershell
-.\Get-SqlSafe.ps1
-```
+   ```powershell
+   .\Get-SqlSafe.ps1
+   ```
 
-5. Enter your SQL Server connection details.
-6. Optionally test the connection and permissions.
-7. Start the assessment.
-8. The generated HTML report is written to the `Results` subfolder and opens automatically unless report launch is disabled.
+5. Enter the SQL Server name or instance.
+6. Select Windows or SQL authentication.
+7. Choose the encryption options required by the target.
+8. Enable AWS RDS compatibility mode when assessing SQL Server on Amazon RDS.
+9. Optionally test the connection and permissions.
+10. Start the assessment.
+
+The generated HTML report is written to the `Results` subfolder and opens automatically unless report launch is disabled.
+
+<!-- Add the updated Get-SqlSafe 2026.4 connection and permission-test screenshot here. -->
 
 If your system blocks script execution, you may run the script with an explicit execution policy for this PowerShell process:
 
@@ -113,7 +125,7 @@ If your system blocks script execution, you may run the script with an explicit 
 powershell.exe -ExecutionPolicy Bypass -File .\Get-SqlSafe.ps1
 ```
 
-This only allows the script to run in that PowerShell process. It does not unblock files permanently and does not install dependencies.
+This permits the script to run in that PowerShell process. It does not unblock files permanently and does not install dependencies.
 
 ---
 
@@ -124,91 +136,60 @@ Supplying `-SqlInstance` automatically runs the script in console mode.
 Windows authentication:
 
 ```powershell
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001" -NoAutoOpenReport
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01"
+```
+
+Run without opening the report automatically:
+
+```powershell
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -NoAutoOpenReport
 ```
 
 SQL authentication:
 
 ```powershell
 $pwd = Read-Host "SQL password" -AsSecureString
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd -NoAutoOpenReport
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd -NoAutoOpenReport
 ```
 
-Mandatory encryption with trusted server certificate:
+Mandatory encryption while trusting the server certificate:
 
 ```powershell
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001" -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
+```
+
+AWS RDS compatibility mode:
+
+```powershell
+.\Get-SqlSafe.ps1 -SqlInstance "my-rds-instance.example.rds.amazonaws.com" -AwsRdsCompat -Encrypt Mandatory -TrustServerCert
 ```
 
 Write a run log:
 
 ```powershell
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001" -WriteLog -NoAutoOpenReport
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -WriteLog -Verbose -NoAutoOpenReport
 ```
 
-Console mode and `-NoAutoOpenReport` are useful for controlled endpoints, automation-friendly execution, and EDR/XDR-controlled environments where UI prompts or automatic browser launch may be restricted.
+Console mode and `-NoAutoOpenReport` are useful for controlled endpoints, automation-friendly execution, and EDR/XDR-controlled environments where UI prompts or automatic browser launches may be restricted.
 
 ---
 
 ## Parameters
 
-`-NoAutoOpenReport`
-
-Prevents the generated HTML report from opening automatically.
-
-`-ConsoleOnly`
-
-Runs without the WPF dialog. Aliases: `-NoUI`, `-NonInteractive`.
-
-`-SqlInstance`
-
-Target SQL Server instance. Supplying this parameter enables console mode.
-
-`-Auth`
-
-Authentication method. Valid values:
-
-```text
-Windows
-SQL
-```
-
-Default is `Windows`.
-
-`-SqlUser`
-
-SQL login name. Required when `-Auth SQL` is used.
-
-`-SqlPass`
-
-SQL login password as a `SecureString`. If omitted for SQL authentication, the script prompts interactively.
-
-`-Encrypt`
-
-Connection encryption behavior. Valid values:
-
-```text
-Optional
-Mandatory
-```
-
-Default is `Optional`.
-
-`-TrustServerCert`
-
-Trusts the SQL Server certificate without certificate-chain validation.
-
-`-WindowsCredential`
-
-Relaunches the assessment under an alternate Windows account. Only valid with Windows authentication and requires `-SqlInstance`.
-
-`-WriteLog`
-
-Writes run output to a log file in the `Results` folder. Alias: `-LogFile`.
-
-`-Verbose`
-
-Shows verbose progress output in the console. This is independent of `-WriteLog`.
+| Parameter | Purpose |
+| --- | --- |
+| `-SqlInstance` | Target SQL Server name or instance. Supplying this parameter enables console mode. |
+| `-ConsoleOnly` | Runs without the WPF dialog. Aliases: `-NoUI`, `-NonInteractive`. |
+| `-Auth` | Authentication method: `Windows` or `SQL`. Defaults to `Windows`. |
+| `-SqlUser` | SQL login name. Required when `-Auth SQL` is used. |
+| `-SqlPass` | SQL login password as a `SecureString`. If omitted for SQL authentication, the script prompts interactively. |
+| `-Encrypt` | Connection encryption mode: `Optional` or `Mandatory`. Defaults to `Optional`. |
+| `-TrustServerCert` | Trusts the SQL Server certificate without certificate-chain validation. |
+| `-AwsRdsCompat` | Enables AWS RDS compatibility behavior and `AWS managed` labels. |
+| `-WindowsCredential` | Relaunches the assessment under another Windows account. Valid with Windows authentication and requires `-SqlInstance`. |
+| `-WriteLog` | Writes run output to a log file in the `Results` folder. Alias: `-LogFile`. |
+| `-Verbose` | Shows verbose progress output in the console independently of `-WriteLog`. |
+| `-NoAutoOpenReport` | Prevents the generated HTML report from opening automatically. |
 
 ---
 
@@ -219,7 +200,7 @@ Shows verbose progress output in the console. This is independent of `-WriteLog`
 Use Windows authentication when the current Windows account has the required SQL Server permissions:
 
 ```powershell
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001"
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01"
 ```
 
 ### Alternate Windows Account
@@ -228,7 +209,7 @@ Use `-WindowsCredential` to relaunch the assessment under another Windows identi
 
 ```powershell
 $cred = Get-Credential
-.\Get-SqlSafe.ps1 -ConsoleOnly -SqlInstance "PRDSQL001" -Auth Windows -WindowsCredential $cred -NoAutoOpenReport
+.\Get-SqlSafe.ps1 -ConsoleOnly -SqlInstance "SQLPROD01" -Auth Windows -WindowsCredential $cred -NoAutoOpenReport
 ```
 
 ### SQL Authentication
@@ -237,8 +218,32 @@ Use SQL authentication with a secure password prompt:
 
 ```powershell
 $pwd = Read-Host "SQL password" -AsSecureString
-.\Get-SqlSafe.ps1 -SqlInstance "PRDSQL001" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd
 ```
+
+---
+
+## AWS RDS Compatibility Mode
+
+Use `-AwsRdsCompat` when assessing SQL Server on Amazon RDS.
+
+When enabled, the collector:
+
+- Adjusts selected permission checks for restricted AWS-managed environments.
+- Skips Check `046` because the required server-level access is not normally available on SQL Server on Amazon RDS.
+- Excludes AWS-managed objects such as `rdsadmin` where applicable.
+- Excludes the `model` database from selected owner checks.
+- Marks selected findings with an `AWS managed` label when the target is detected as RDS.
+
+AWS RDS compatibility mode does not imply that every control managed by AWS is secure or correctly configured. It distinguishes selected platform-managed conditions from findings under direct customer control.
+
+---
+
+## Contained Availability Groups
+
+Check `802` reports contained availability group names and listener DNS/port details when SQL Server 2022 or newer exposes the required metadata.
+
+> **Important:** Contained availability groups maintain security principals and metadata separately from the host SQL Server instance. Checks that depend on this security context, such as identifying orphaned database users, must be executed through the contained availability group context to produce accurate results.
 
 ---
 
@@ -248,13 +253,13 @@ The assessment is designed to run with least privilege using a dedicated login w
 
 Recommended practices:
 
-* Use a dedicated assessment login.
-* Do not use personal or shared administrator accounts unless required by the target environment and approved by your process.
-* Grant only the permissions needed for the target SQL Server version.
-* Remove or disable the assessment login after use if it is not part of an approved recurring process.
-* Review generated reports as sensitive security output.
+- Use a dedicated assessment login.
+- Do not use personal or shared administrator accounts unless required by the target environment and approved by your process.
+- Grant only the permissions needed for the target SQL Server version.
+- Remove or disable the assessment login after use if it is not part of an approved recurring process.
+- Review generated reports as sensitive security output.
 
-The examples below use `SqlAssessmentReader` as the assessment principal.
+The examples below use `SqlAssessmentReader` as the assessment principal. They apply to self-managed SQL Server. SQL Server on Amazon RDS has a different permission model; use an account with the available metadata permissions and enable `-AwsRdsCompat`.
 
 ### SQL Server 2022+
 
@@ -298,45 +303,63 @@ The script includes a connection and permission test in the GUI. In console mode
 
 The assessment covers high-level indicators across areas such as:
 
-* Authentication configuration
-* SQL authentication and NTLM usage
-* Sysadmin and powerful server role memberships
-* Server-level permissions
-* TRUSTWORTHY and cross-database ownership chaining
-* Powerful features such as `xp_cmdshell`, ad hoc distributed queries, and OLE Automation
-* Orphaned Windows logins and database users
-* SQL Server security audit configuration
-* Database ownership risks
-* SQL Server error log retention
-* System overview and informational context
+- Authentication configuration
+- SQL authentication, password-policy enforcement, and NTLM usage
+- Sysadmin and powerful server role memberships
+- Server-level permissions
+- `TRUSTWORTHY` and cross-database ownership chaining
+- Powerful features such as `xp_cmdshell`, ad hoc distributed queries, and OLE Automation
+- Orphaned Windows logins and database users
+- SQL Server security audit configuration
+- Database ownership risks
+- SQL Server error log retention
+- Availability groups and contained availability groups
+- System overview and informational context
 
-The report includes:
+The HTML report includes:
 
-* Target server and report metadata
-* Outcome badges: `PASS`, `OBSERVE`, `WARNING`, `FAIL`, `INFO`
-* Detail tables for findings
-* Recommendations and reference links where applicable
-* Informational context for version and system overview checks
+- Execution metadata and target summary
+- Outcome distribution chart
+- Category summary table with status counts and total indicators
+- Outcome definition legend
+- Detailed findings grouped by category
+- Recommendations and references for actionable findings
+- Informational context for version and system overview checks
 
 ---
 
-## Output
+## Result Meanings
 
-The tool generates a local HTML report in the `Results` folder.
+The report uses five outcome states:
 
-The report filename includes the target server and timestamp.
+| Outcome | Meaning |
+| --- | --- |
+| `INFO` | Provides useful context. It does not indicate a security finding. |
+| `PASS` | The assessed condition met the expected rule. |
+| `OBSERVE` | Marks a condition that is not necessarily risky by itself but should be reviewed or monitored. Impact depends on environment, intent, and compensating controls. |
+| `WARNING` | Indicates a security-relevant finding that should be reviewed and usually remediated, but does not by itself indicate immediate high risk. |
+| `FAIL` | Indicates a clear security risk that requires prompt attention. |
 
-When `-WriteLog` is used, a `.log` file is also written to the same folder.
+For `OBSERVE`, `WARNING`, and `FAIL` findings, the report includes recommendation text and, where available, reference links.
 
-Generated reports may contain environment-specific security details, including:
+---
 
-* Server configuration details
-* Login and role membership details
-* Permission details
-* Database ownership details
-* Security findings and recommendations
+## Output, Security, and Data Handling
+
+The tool generates a local HTML report in the `Results` folder. The report filename includes the target server and timestamp. When `-WriteLog` is used, a `.log` file is also written to the same folder.
+
+Generated reports and logs may include sensitive environment-specific information, including:
+
+- Server and database names
+- Login and role membership details
+- Permission details
+- Configuration values
+- Database ownership details
+- Security findings and recommendations
 
 Handle generated reports according to your organization's data handling and confidentiality requirements.
+
+The collector does not intentionally change SQL Server configuration or data. It reads metadata and reports high-level indicators.
 
 ---
 
@@ -360,7 +383,7 @@ This helps detect accidental edits, copy/paste damage, or mismatched build artif
 
 ---
 
-## Enterprise Usage & Trust
+## Enterprise Usage and Trust
 
 This tool is distributed as a plain-text PowerShell script so organizations can review it according to internal security and change-control processes.
 
@@ -368,38 +391,38 @@ This tool is distributed as a plain-text PowerShell script so organizations can 
 
 Get-SqlSafe Community Edition:
 
-* runs locally from the extracted folder
-* connects to SQL Server using Windows or SQL authentication
-* executes embedded SQL assessment logic
-* validates the embedded SQL text using SHA-256 before execution
-* writes a local HTML report to the `Results` folder
-* can optionally write a run log to the `Results` folder
-* does not install PowerShell modules automatically
-* does not modify SQL Server configuration as part of the assessment
+- Runs locally from the extracted folder.
+- Connects to SQL Server using Windows or SQL authentication.
+- Executes embedded SQL assessment logic.
+- Validates the embedded SQL text using SHA-256 before execution.
+- Writes a local HTML report to the `Results` folder.
+- Can optionally write a run log to the `Results` folder.
+- Does not install PowerShell modules automatically.
+- Does not intentionally modify SQL Server configuration or data as part of the assessment.
 
-### Recommended enterprise process
+### Recommended Enterprise Process
 
 #### 1. Review
 
 Review the PowerShell script before running it in production or customer environments.
 
-#### 2. Verify file integrity
+#### 2. Verify File Integrity
 
 ```powershell
 Get-FileHash .\Get-SqlSafe.ps1 -Algorithm SHA256
 ```
 
-#### 3. Unblock downloaded files
+#### 3. Unblock Downloaded Files
 
 ```powershell
 Unblock-File .\Get-SqlSafe.ps1
 ```
 
-#### 4. Test first
+#### 4. Test First
 
 Run the assessment against a non-production SQL Server instance before using it in a production environment.
 
-#### 5. Re-sign internally if required
+#### 5. Re-sign Internally if Required
 
 If your organization enforces `AllSigned`, sign the approved PowerShell file with your internal code-signing certificate after review.
 
@@ -414,12 +437,28 @@ Follow your internal process for code review, signing, packaging, and deployment
 
 ---
 
-## Notes
+## Scope and Limitations
 
-* Output may contain sensitive environment-specific information.
-* The tool identifies indicators of risk; it does not enforce configuration changes.
-* Some checks may require permissions that are not available on older SQL Server versions without elevated access.
-* Community Edition focuses on high-level indicators and does not represent a complete security audit.
+The Community Edition is intentionally limited. It is not:
+
+- A penetration test.
+- A compliance assessment.
+- A full SQL Server security review.
+- A guarantee that the target SQL Server is secure.
+
+A clean report means that the covered baseline indicators did not identify findings. SQL Server's real attack surface is broader and depends on combinations of permissions, ownership, impersonation, SQL Agent, linked servers, database configuration, service accounts, backups, operating-system security posture, and platform-specific controls.
+
+Some checks may require permissions that are not available on older SQL Server versions or managed platforms without elevated access. Use the report as a starting point for deeper review and remediation planning.
+
+---
+
+## Upgrade Notes from 2026.3
+
+- Review [`CHANGELOG.md`](CHANGELOG.md) before replacing older scripts.
+- Replace the previous collector with the new `Get-SqlSafe.ps1` file.
+- Remove the old `SqlSafe.sql` file if it remains in a working folder; it is no longer used.
+- Test the collector against a non-production SQL Server before broad use.
+- Use `-AwsRdsCompat` when assessing SQL Server on Amazon RDS.
 
 ---
 
@@ -429,22 +468,22 @@ Follow your internal process for code review, signing, packaging, and deployment
 
 The full **Sarpedon SQL Server Security Assessment** can include advanced architectural checks such as:
 
-* Deep database-level configuration audits
-* OS-level and backup security reviews
-* Advanced account attribution and lateral movement mapping
-* High availability, operational, and governance-focused review areas
+- Deep database-level configuration audits
+- OS-level and backup security reviews
+- Advanced account attribution and lateral-movement mapping
+- High availability, operational, and governance-focused review areas
 
-[Explore Full-Scope Security Assessments at Sarpedon Quality Lab](https://sarpedonqualitylab.us/sql-server-security-assessment/)
+[Explore full-scope SQL Server security assessments at Sarpedon Quality Lab](https://sarpedonqualitylab.us/sql-server-security-assessment/).
 
 ---
 
-## License
+## License and Attribution
 
-This project is distributed under the Sarpedon Community License.
+Logic & Engine by Andreas Wolter (MCSM), Sarpedon Quality Lab.
 
-Use is permitted for internal business or personal purposes. Redistribution, white-labeling, or commercial resale of modified versions or generated reports is restricted by the license terms.
+This project is distributed under the Sarpedon Community License. Use is permitted for internal business or personal purposes. Redistribution, white-labeling, or commercial resale of modified versions or generated reports is restricted by the license terms.
 
-See `LICENSE.md` for the full license text.
+See [`LICENSE.md`](LICENSE.md) for the full license text. Use the tool only on systems where you have authorization to run security assessment tooling.
 
 ---
 
