@@ -1,6 +1,61 @@
-# Get-SqlSafe Community Edition 2026.3 - Public Changelog Summary
+# Get-SqlSafe Community Edition — Changelog
 
-## Major Changes
+## 2026.4
+
+### Major Changes
+
+- Added AWS RDS compatibility support.
+  The collector now has an `-AwsRdsCompat` switch and a GUI option for AWS RDS compatible checks. When enabled, the assessment adjusts selected checks for AWS-managed SQL Server behavior and skips the Windows-login orphan check that requires server-level access not normally available on RDS.
+
+### Assessment and SQL Changes
+
+- Added Check `006` - `SQL Logins without password policy enforcement`.
+  The check reports SQL logins where password policy enforcement is disabled and fails when one or more rows are returned.
+
+- Updated Check `028` - `Databases with Trustworthy property set`.
+  The check now excludes contained availability group `_msdb` databases.
+
+- Updated Check `059` - `Security Auditing minimal setup`.
+  `EXTGOV_OPERATION_GROUP` was removed from the minimum audit action baseline.
+
+- Updated Check `802` - `Contained Availability Groups`.
+  The check now returns contained availability group names and listener DNS/port information instead of just a number. The recommendation now also includes a note that contained availability groups maintain security principals and metadata separately from the host instance.
+
+- Improved availability group handling.
+
+### AWS RDS Behavior
+
+- Added an `AWS managed` visual label for selected checks when the target is AWS RDS.
+
+- AWS RDS compatibility mode adjusts selected collection and filtering behavior:
+  - Skips Check `046` by design because of security limitations on AWS RDS SQL Server.
+  - Excludes AWS-managed rows such as `rdsadmin` where applicable.
+  - Excludes the model database from selected owner checks.
+
+### Report Changes
+
+- Added a category summary section between the outcome filter and the first detail area.
+  The table shows per-category counts for `INFO`, `PASS`, `OBSERVE`, `WARNING`, `FAIL`, and total `Indicators`.
+
+- Added an outcome definition legend.
+
+- Improved category placement for several checks.
+
+
+### Compatibility Notes
+
+- Windows PowerShell 5.1 remains the expected runtime.
+- SQL Server 2016 or newer is recommended for least-privilege modern use.
+- SQL Server 2012 and 2014 may require higher privileges for some checks.
+- Contained availability group details only surface in SQL Server 2022 or newer.
+- The generated HTML reports may contain sensitive environment information and should be handled accordingly.
+- The Community Edition remains a high-level indicator assessment and does not replace a full SQL Server security audit.
+
+---
+
+## 2026.3
+
+### Major Changes
 
 - Converted the assessment to a self-contained PowerShell script.  
   The SQL assessment logic is now embedded in the PowerShell collector, so the public package no longer needs a separate `SqlSafe.sql` file.
@@ -26,14 +81,14 @@
 - Added explicit process exit codes.  
   The collector now distinguishes successful runs, startup/validation failures, and SQL connection/execution failures.
 
-## Packaging and Dependency Changes
+### Packaging and Dependency Changes
 
 - The public package now centers on a single collector script: `Get-SqlSafe.ps1`.
 - The previous external `SqlSafe.sql` file is no longer required and is no longer used.
 - The embedded SQL assessment text is validated before execution using SHA-256.
 - The embedded SQL hash validation is intended to detect accidental edits, copy/paste damage, or mismatched build artifacts. For tamper protection, use normal file-hash validation and code signing.
 
-## Assessment and SQL Changes
+### Assessment and SQL Changes
 
 - Added Check `800` - `System Overview`.  
   The report now includes contextual instance metadata such as version, edition, uptime, availability group counts, database count, login count, and active connections.
@@ -59,13 +114,13 @@
 
 - Added version-based applicability handling for selected informational checks.
 
-## Report Changes
+### Report Changes
 
 - Updated the HTML report generation flow.
 
 - Improved report table layout.
 
-## Operational Changes
+### Operational Changes
 
 - Added early log file initialization when logging is enabled.  
   Startup, validation, relaunch, and SQL execution messages can now be captured in the run log.
@@ -75,18 +130,18 @@
 - Improved SQL login handling.  
   SQL authentication uses `SqlCredential` and `SecureString` instead of embedding SQL passwords into connection strings.
 
-## Acknowledgements
+### Acknowledgements
 
 Thanks to Danny de Haan for the suggestion that led to the alternate Windows credential execution option.
 
-## Upgrade Notes
+### Upgrade Notes
 
 - Replace the previous package with `Get-SqlSafe.ps1`.
 - Remove the old `SqlSafe.sql` file if it exists in a local working folder.
 - No `SqlServer` PowerShell module installation is required for SQL execution.
 - Test the script against a non-production SQL Server before broad use.
 
-## Compatibility Notes
+### Compatibility Notes
 
 - Windows PowerShell 5.1 remains the expected runtime.
 - SQL Server 2012 or newer is expected.
