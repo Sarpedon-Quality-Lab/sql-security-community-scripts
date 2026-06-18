@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     SQL Server Security Assessment Collector - Community Edition
 
@@ -33,9 +33,21 @@
 .PARAMETER TrustServerCert
     Trusts the server certificate without validation.
 
+.PARAMETER SkipChecks
+    Check IDs to skip. Use this for checks that are incompatible with restricted platforms.
+    Example: -SkipChecks 046 skips the orphaned Windows logins check that requires securityadmin-role membership.
+
+.PARAMETER AwsRdsCompat
+    Enables AWS RDS compatibility mode. This adjusts the permission test, excludes the model database
+    from database-owner checks, excludes AWS RDS-managed rows such as rdsadmin where applicable,
+    and skips check 046 by design, independently of -SkipChecks.
+
 .PARAMETER WindowsCredential
     Relaunches the assessment under an alternate Windows account via Start-Process -Credential.
     Requires -SqlInstance. Only valid with -Auth Windows (default).
+
+.PARAMETER Verbose
+    Shows progress and operational messages in the console.
 
 .PARAMETER WriteLog
     Writes diagnostic output to a .log file alongside the HTML report.
@@ -43,7 +55,7 @@
     -Verbose controls console output; -WriteLog controls file output.
 
 .NOTES
-    Version:  2026.3
+    Version:  2026.4
     Author:   Andreas Wolter (Sarpedon Quality Lab)
     License:  Sarpedon Community License
     Website:  https://www.SarpedonQualityLab.US/resources
@@ -88,12 +100,21 @@
     $cred = Get-Credential
     .\Get-SqlSafe.ps1 -ConsoleOnly -SqlInstance "SQLPROD01" -Auth Windows -WindowsCredential $cred -Verbose -NoAutoOpenReport
 
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -SkipChecks 046 -NoAutoOpenReport
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "AWS-RDS-SQL01" -AwsRdsCompat -NoAutoOpenReport
+
+.EXAMPLE
+    $pwd = Read-Host "SQL password" -AsSecureString
+    .\Get-SqlSafe.ps1 -SqlInstance "AWS-RDS-SQL01" -Auth SQL -SqlUser assessment_user -SqlPass $pwd -AwsRdsCompat -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
 #>
 
 
-[CmdletBinding()]
 param(
     [switch]$NoAutoOpenReport,
+    [switch]$Verbose,
     [Alias('NoUI','NonInteractive')]
     [switch]$ConsoleOnly,
     [string]$SqlInstance,
@@ -104,6 +125,8 @@ param(
     [ValidateSet('Optional','Mandatory')]
     [string]$Encrypt = 'Optional',
     [switch]$TrustServerCert,
+    [string[]]$SkipChecks = @(),
+    [switch]$AwsRdsCompat,
     [System.Management.Automation.PSCredential]$WindowsCredential,
     [Alias('LogFile')]
     [switch]$WriteLog
@@ -117,6 +140,9 @@ $script:VerboseEnabled             = ($PSBoundParameters.ContainsKey('Verbose') 
 $script:WriteLogEnabled            = [bool]$WriteLog
 $script:LogPath                    = $null
 $script:LogBuffer                  = New-Object System.Collections.Generic.List[string]
+$script:SkipChecks                 = @($SkipChecks)
+$script:AwsRdsCompat               = [bool]$AwsRdsCompat
+$script:SecurityAdminRequiredCheckIds = @('046')
 $script:WindowsCredentialSpecified = $PSBoundParameters.ContainsKey('WindowsCredential')
 if (-not [string]::IsNullOrWhiteSpace($SqlInstance) -or $script:WindowsCredentialSpecified) { $ConsoleOnly = $true }
 $script:ConsoleOnly                = [bool]$ConsoleOnly
@@ -157,6 +183,7 @@ function Write-Log {
         }
     }
 }
+
 
 function Start-SqlSafeLogFile {
     param(
@@ -235,8 +262,8 @@ function Stop-SqlSafeRun {
 
 # --- CONFIGURATION ---
 $ScriptRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ReleaseVersion = '2026.3'
-$RequiredSql = 'd8ccfe4d95db45b49d1ec9038d18ff4e2fe7b2b89186a3c456c38177bb460f60'
+$ReleaseVersion = '2026.4'
+$RequiredSql = 'b87feb6e932f3009a1c2f13d2fba9750c956d9cdd082e36c97eed5e3a923c927'
 $ResultsFolder = Join-Path $ScriptRoot 'Results'
 if (-not (Test-Path $ResultsFolder)) { New-Item -ItemType Directory -Path $ResultsFolder | Out-Null }
 
@@ -291,8 +318,13 @@ if ($script:WindowsCredentialSpecified) {
     $childCommandParts.Add((ConvertTo-PSQuotedString $Encrypt))
 
     if ($TrustServerCert) { $childCommandParts.Add('-TrustServerCert') }
+    if ($SkipChecks -and $SkipChecks.Count -gt 0) {
+        $childCommandParts.Add('-SkipChecks')
+        $childCommandParts.Add((ConvertTo-PSQuotedString ($SkipChecks -join ',')))
+    }
+    if ($AwsRdsCompat) { $childCommandParts.Add('-AwsRdsCompat') }
     if ($NoAutoOpenReport) { $childCommandParts.Add('-NoAutoOpenReport') }
-    if ($VerbosePreference -eq 'Continue') { $childCommandParts.Add('-Verbose') }
+    if ($script:VerboseEnabled) { $childCommandParts.Add('-Verbose') }
     if ($WriteLog) { $childCommandParts.Add('-WriteLog') }
 
     $childCommand   = $childCommandParts -join ' '
@@ -343,6 +375,7 @@ $Username                  = ''
 $Password                  = [System.Security.SecureString]::new()
 $EncryptOption             = 'Optional'
 $TrustCert                 = $false
+$ActiveSkipChecks          = @($SkipChecks)
 
 $SqlServer                 = $null
 $Database                  = 'master'
@@ -389,7 +422,14 @@ function Show-UiMessage {
 }
 
 function Get-DialogInput {
-    param($ServerInput, $AuthDropdown, $UsernameInput, $PasswordInput, $EncryptOption, $TrustCert)
+    param($ServerInput, $AuthDropdown, $UsernameInput, $PasswordInput, $EncryptOption, $TrustCert, $SkipSecurityAdminChecks, $AwsRdsCompatChecks)
+
+    $dialogSkipChecks = New-Object System.Collections.Generic.List[string]
+    if ($SkipSecurityAdminChecks -and [bool]$SkipSecurityAdminChecks.IsChecked) {
+        foreach ($checkId in $script:SecurityAdminRequiredCheckIds) {
+            $dialogSkipChecks.Add($checkId) | Out-Null
+        }
+    }
 
     [pscustomobject]@{
         SqlServer     = $ServerInput.Text.Trim()
@@ -398,6 +438,8 @@ function Get-DialogInput {
         Password      = $PasswordInput.SecurePassword
         EncryptOption = if ($EncryptOption.SelectedItem) { [string]$EncryptOption.SelectedItem.Tag } else { 'Optional' }
         TrustCert     = [bool]$TrustCert.IsChecked
+        SkipChecks    = [string[]]$dialogSkipChecks.ToArray()
+        AwsRdsCompat  = ($AwsRdsCompatChecks -and [bool]$AwsRdsCompatChecks.IsChecked)
     }
 }
 
@@ -568,7 +610,24 @@ SELECT
         $metadataReader.Close()
 
         if ($majorVersion -ge 12) {
-            $permissionSql = @"
+            if ($InputObject.PSObject.Properties['AwsRdsCompat'] -and [bool]$InputObject.AwsRdsCompat) {
+                $permissionSql = @"
+SELECT
+    v.permission_name AS role_or_permission,
+    CASE HAS_PERMS_BY_NAME(NULL, NULL, v.permission_name)
+        WHEN 1 THEN N'Yes'
+        WHEN 0 THEN N'No'
+        ELSE N'UNKNOWN'
+    END AS check_status
+FROM (VALUES
+    (N'VIEW SERVER SECURITY STATE'),
+    (N'VIEW ANY SECURITY DEFINITION'),
+    (N'VIEW SERVER PERFORMANCE STATE')
+) v(permission_name);
+"@
+            }
+            else {
+                $permissionSql = @"
 SELECT
     N'securityadmin OR sysadmin' AS role_or_permission,
     CASE
@@ -594,6 +653,7 @@ FROM (VALUES
     (N'CONNECT ANY DATABASE')
 ) v(permission_name);
 "@
+            }
         }
         else {
             $permissionSql = @"
@@ -824,6 +884,74 @@ function Get-RowCheckName {
 }
 
 
+function Resolve-SkipChecks {
+    param(
+        [AllowNull()]
+        [string[]]$RequestedSkipChecks
+    )
+
+    $resolved = New-Object System.Collections.Generic.List[string]
+
+    foreach ($item in @($RequestedSkipChecks)) {
+        if ([string]::IsNullOrWhiteSpace($item)) { continue }
+
+        foreach ($part in ([string]$item -split ',')) {
+            $normalized = Normalize-CheckId $part
+            if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+            if (-not $resolved.Contains($normalized)) {
+                $resolved.Add($normalized) | Out-Null
+            }
+        }
+    }
+
+    return [string[]]$resolved.ToArray()
+}
+
+function Remove-SkippedAssessmentSqlBatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SqlText,
+
+        [AllowNull()]
+        [string[]]$SkipCheckIds
+    )
+
+    $normalizedSkipCheckIds = @(Resolve-SkipChecks -RequestedSkipChecks $SkipCheckIds)
+    if ($normalizedSkipCheckIds.Count -eq 0) { return $SqlText }
+
+    $batches = @($SqlText -split '(?im)^\s*GO\s*$')
+    $keptBatches = New-Object System.Collections.Generic.List[string]
+
+    foreach ($batch in $batches) {
+        if ([string]::IsNullOrWhiteSpace($batch)) { continue }
+
+        $batchCheckIds = New-Object System.Collections.Generic.List[string]
+        $matches = [System.Text.RegularExpressions.Regex]::Matches(
+            $batch,
+            "(?i)(?:N)?'(?<CheckId>\d{1,3})'\s+AS\s+\[(?:Check\s*ID|CheckID)\]"
+        )
+
+        foreach ($match in $matches) {
+            $checkId = Normalize-CheckId $match.Groups['CheckId'].Value
+            if ([string]::IsNullOrWhiteSpace($checkId)) { continue }
+            if (-not $batchCheckIds.Contains($checkId)) {
+                $batchCheckIds.Add($checkId) | Out-Null
+            }
+        }
+
+        if ($batchCheckIds.Count -eq 0) {
+            $keptBatches.Add($batch.Trim()) | Out-Null
+            continue
+        }
+
+        $remainingIds = @($batchCheckIds.ToArray() | Where-Object { $_ -notin $normalizedSkipCheckIds })
+        if ($remainingIds.Count -gt 0) {
+            $keptBatches.Add($batch.Trim()) | Out-Null
+        }
+    }
+
+    return ($keptBatches.ToArray() -join "`r`nGO`r`n")
+}
 
 function Get-RowsFromCheckBucket {
     param(
@@ -1430,6 +1558,30 @@ function Get-SqlServerMajorVersionFromRows {
     return $null
 }
 
+function Test-AwsRdsInstanceFromRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows
+    )
+
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+        if ((Get-RowCheckId $row) -ne '800') { continue }
+        if (-not $row.PSObject.Properties['Item']) { continue }
+        if (-not $row.PSObject.Properties['Value']) { continue }
+
+        $itemName = ([string]$row.Item).Trim()
+        $itemValue = ([string]$row.Value).Trim()
+
+        if ($itemName -eq 'AWS RDS detected') {
+            return ($itemValue -eq 'Yes')
+        }
+    }
+
+    return $false
+}
+
 function Get-CheckApplicability {
     param(
         [Parameter(Mandatory = $true)]
@@ -1601,7 +1753,7 @@ $EmbeddedAssessmentSql = @'
 /******************************************************************************
 * SQL Server Security Assessment - Community Edition
 * Logic & Engine by Andreas Wolter (MCSM)
-* Version:    2026.3
+* Version:    2026.4
 * Scope:      High-Level Security Indicators
 * License:    Sarpedon Community License (See LICENSE.md)
 * Resources:  https://www.SarpedonQualityLab.US/resources
@@ -1630,7 +1782,6 @@ SET NOCOUNT ON;
 
 SELECT
     '002' AS [Check ID],
-    'Authentication Mode' AS [Check Name],
     CASE SERVERPROPERTY('IsIntegratedSecurityOnly')
         WHEN 1 THEN 'Windows Authentication'
         WHEN 0 THEN 'Windows and SQL Server Authentication (Mixed Mode)'
@@ -1654,7 +1805,6 @@ WITH Connections AS
 )
 SELECT
     '003' AS [Check ID],
-    'SQL Authentication usage' AS [Check Name],
     SUM(CASE WHEN auth_scheme = 'SQL' THEN 1 ELSE 0 END) AS SqlAuthenticationSessionCount,
     CAST(
         100.0 * SUM(CASE WHEN auth_scheme = 'SQL' THEN 1 ELSE 0 END)
@@ -1674,7 +1824,6 @@ WITH Connections AS
 )
 SELECT
     '004' AS [Check ID],
-    'NTLM Authentication usage' AS [Check Name],
     SUM(CASE WHEN auth_scheme = 'NTLM' THEN 1 ELSE 0 END) AS NtlmAuthenticationSessionCount,
     CAST(
         100.0 * SUM(CASE WHEN auth_scheme = 'NTLM' THEN 1 ELSE 0 END)
@@ -1686,8 +1835,26 @@ FROM Connections;
 GO
 
 SELECT
+    '006' AS [Check ID],
+    name AS LoginName,
+    (
+        SELECT
+            is_disabled AS IsDisabled,
+            create_date AS CreateDate,
+            modify_date AS ModifyDate,
+            default_database_name AS DefaultDatabaseName,
+            is_policy_checked AS CheckPolicyEnabled,
+            is_expiration_checked AS CheckExpirationEnabled
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.sql_logins
+WHERE is_policy_checked = 0
+ORDER BY name;
+
+GO
+
+SELECT
     '008' AS [Check ID],
-    'SA Login Name' AS [Check Name],
     name AS LoginName,
     modify_date AS ModifyDate
 FROM sys.server_principals
@@ -1697,7 +1864,6 @@ GO
 
 SELECT
     '010' AS [Check ID],
-    'Sysadmin-members individual accounts' AS [Check Name],
     server_principals.type_desc AS PrincipalType,
     name AS LoginName,
     (
@@ -1719,7 +1885,6 @@ GO
 
 SELECT
     '011' AS [Check ID],
-    'Server role membership with direct Elevation-of-Privilege Risk' AS [Check Name],
     serverrole.name AS ServerRoleName,
     rolemember.name AS MemberName,
     (
@@ -1747,7 +1912,6 @@ GO
 
 SELECT
     '015' AS [Check ID],
-    'Powerful server role membership individual accounts' AS [Check Name],
     serverrole.name AS ServerRoleName,
     rolemember.name AS MemberName,
     (
@@ -1814,7 +1978,6 @@ BEGIN TRY
 
     SELECT
         '026' AS [Check ID],
-        'Server permissions granted to Logins' AS [Check Name],
         server_principals.name AS LoginName,
         server_permissions.permission_name AS PermissionName,
         (
@@ -1885,7 +2048,6 @@ GO
 
 SELECT
     '027' AS [Check ID],
-    'Custom server roles without members' AS [Check Name],
     name AS ServerRoleName,
     principal_id AS PrincipalId,
     (
@@ -1908,28 +2070,45 @@ ORDER BY name;
 
 GO
 
+DECLARE @Check028Sql nvarchar(max) = N'
 SELECT
-    '028' AS [Check ID],
-    'Databases with Trustworthy property set' AS [Check Name],
-    name AS DatabaseName,
-    is_trustworthy_on AS IsTrustworthyOn,
+    ''028'' AS [Check ID],
+    databases.name AS DatabaseName,
+    databases.is_trustworthy_on AS IsTrustworthyOn,
     (
         SELECT
-            state_desc AS State,
-            create_date,
-            database_id
-        FOR XML PATH('AdditionalInfo'), TYPE
+            databases.state_desc AS State,
+            databases.create_date,
+            databases.database_id
+        FOR XML PATH(''AdditionalInfo''), TYPE
     ) AS AdditionalInfo
-FROM sys.databases
-WHERE is_trustworthy_on = 1
-  AND name <> 'msdb'
-ORDER BY name;
+FROM sys.databases AS databases
+WHERE databases.is_trustworthy_on = 1
+  AND databases.name <> N''msdb''';
+
+IF CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)),
+             CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS varchar(50))) - 1) AS int) >= 16
+BEGIN
+    SET @Check028Sql = @Check028Sql + N'
+  AND NOT EXISTS
+  (
+      SELECT 1
+      FROM sys.availability_groups AS availability_groups
+      WHERE availability_groups.is_contained = 1
+        AND databases.name =
+            CONCAT(availability_groups.name, N''_msdb'')
+  )';
+END;
+
+SET @Check028Sql = @Check028Sql + N'
+ORDER BY databases.name;';
+
+EXEC sys.sp_executesql @Check028Sql;
 
 GO
 
 SELECT
     '031' AS [Check ID],
-    'Cross Database ownership chaining setting' AS [Check Name],
     name AS DatabaseName,
     CAST(is_db_chaining_on AS INT) AS IsDbChainingOn,
     (
@@ -1948,7 +2127,6 @@ GO
 
 SELECT
     '034' AS [Check ID],
-    'XP_cmdshell setting' AS [Check Name],
     value AS ConfiguredValue,
     value_in_use AS RunningValue
 FROM sys.configurations
@@ -1960,7 +2138,6 @@ GO
 
 SELECT
     '036' AS [Check ID],
-    'Ad Hoc distributed queries setting' AS [Check Name],
     name AS ConfigurationName,
     value AS ConfiguredValue,
     (
@@ -1978,7 +2155,6 @@ GO
 
 SELECT
     '038' AS [Check ID],
-    'OLE Automation Procedures setting' AS [Check Name],
     name AS ConfigurationName,
     value AS ConfiguredValue,
     (
@@ -2005,7 +2181,6 @@ EXEC sp_validatelogins;
 
 SELECT
     '046' AS [Check ID],
-    'Orphaned Windows Logins' AS [Check Name],
     SID AS SID,
     OrphanedUser AS OrphanedUser
 FROM @ValidateLogins;
@@ -2029,7 +2204,6 @@ END CATCH;
 
 SELECT
     '050' AS [Check ID],
-    'Number of Error Logs kept' AS [Check Name],
     CASE
         WHEN @RegReadResult <> 0 OR @NumberOfErrorLogs IS NULL THEN 'Not set. Using default.'
         ELSE 'custom'
@@ -2050,7 +2224,6 @@ BEGIN
     (
         SELECT ''AUDIT_CHANGE_GROUP'' AS AuditActionName UNION ALL
         SELECT ''DBCC_GROUP'' UNION ALL
-        SELECT ''EXTGOV_OPERATION_GROUP'' UNION ALL
         SELECT ''SERVER_OBJECT_CHANGE_GROUP'' UNION ALL
         SELECT ''SERVER_OBJECT_OWNERSHIP_CHANGE_GROUP'' UNION ALL
         SELECT ''SERVER_OBJECT_PERMISSION_CHANGE_GROUP'' UNION ALL
@@ -2089,7 +2262,6 @@ BEGIN
     )
     SELECT
         ''059'' AS [Check ID],
-        ''Security Auditing minimal setup'' AS [Check Name],
         aaa.AuditActionName AS AuditActionName,
         CASE
             WHEN cad.AuditActionName IS NULL THEN ''Not Covered''
@@ -2135,7 +2307,6 @@ EXEC master.dbo.xp_instance_regread
 
 SELECT
     '069' AS [Check ID],
-    'Basic Login-Failure logging status' AS [Check Name],
     @AuditLevel AS AuditLevel,
     CASE @AuditLevel
                         WHEN 0 THEN 'None'
@@ -2167,15 +2338,31 @@ DECLARE @PreparedOwners TABLE
 
 DECLARE
       @dbname sysname
+    , @dbstate_desc nvarchar(60)
     , @sql    nvarchar(max);
+DECLARE @SqlSafeExcludeModelDatabase bit = 0;
+
 DECLARE database_owner_cursor CURSOR LOCAL FAST_FORWARD FOR
-SELECT name
-FROM sys.databases
-WHERE state_desc = 'ONLINE'
+SELECT
+    databases.name,
+    databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id = databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
 
 OPEN database_owner_cursor;
 
-FETCH NEXT FROM database_owner_cursor INTO @dbname;
+FETCH NEXT FROM database_owner_cursor INTO @dbname, @dbstate_desc;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
@@ -2193,7 +2380,7 @@ WHERE dp.name = N''dbo'';
         , N'@dbname sysname'
         , @dbname = @dbname;
 
-    FETCH NEXT FROM database_owner_cursor INTO @dbname;
+    FETCH NEXT FROM database_owner_cursor INTO @dbname, @dbstate_desc;
 END;
 
 CLOSE database_owner_cursor;
@@ -2243,7 +2430,6 @@ LEFT JOIN sys.server_role_members AS srm
 
 SELECT
       '072' AS [Check ID]
-    , 'Database Owner sysadmin' AS [Check Name]
     , dbname AS DatabaseName
     , principal_name AS OwnerName
     , (
@@ -2260,7 +2446,6 @@ ORDER BY database_id ASC;
 
 SELECT
       '078' AS [Check ID]
-    , 'Database Owner Windows Account' AS [Check Name]
     , dbname AS DatabaseName
     , principal_name AS OwnerName
     , (
@@ -2276,7 +2461,6 @@ ORDER BY database_id ASC;
 
 SELECT
       '155' AS [Check ID]
-    , 'Invalid database owner' AS [Check Name]
     , dbname AS DatabaseName
     , matched_owner AS MatchedOwnerName
     , (
@@ -2294,7 +2478,6 @@ GO
 
 SELECT
     '079' AS [Check ID],
-    'SA Login State' AS [Check Name],
     name AS LoginName,
     is_disabled AS IsDisabled,
     (
@@ -2310,30 +2493,41 @@ GO
 DECLARE @Check113 TABLE
 (
       [Check ID]      varchar(10)
-    , [Check Name]    nvarchar(200)
     , DatabaseRoleName sysname
     , PrincipalId     int
     , AdditionalInfo  xml
 );
 
 DECLARE @DatabaseName113 sysname;
+DECLARE @DatabaseStateDesc113 nvarchar(60);
 DECLARE @Sql113 nvarchar(max);
 
 DECLARE db_cursor_113 CURSOR LOCAL FAST_FORWARD FOR
-SELECT name
-FROM sys.databases
-WHERE database_id > 4
-  AND state_desc = 'ONLINE';
+SELECT
+    databases.name,
+    databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id = databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
 
 OPEN db_cursor_113;
-FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113;
+FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113, @DatabaseStateDesc113;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
     SET @Sql113 = N'
     SELECT
           ''113''
-        , ''Custom database roles without members''
         , roles.name AS DatabaseRoleName
         , roles.principal_id AS PrincipalId
         , (
@@ -2357,7 +2551,7 @@ BEGIN
     INSERT INTO @Check113
     EXEC sys.sp_executesql @Sql113;
 
-    FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113;
+    FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113, @DatabaseStateDesc113;
 END
 
 CLOSE db_cursor_113;
@@ -2369,38 +2563,99 @@ GO
 
 DECLARE @Check129 TABLE
 (
-      [Check ID]              varchar(10)
-    , [Check Name]    nvarchar(200)
+      [Check ID]       varchar(10)
     , DatabaseUserName sysname
-    , PrincipalType   nvarchar(60)
-    , AdditionalInfo  xml
+    , PrincipalType    nvarchar(60)
+    , AdditionalInfo   xml
+);
+
+DECLARE @ContainedAvailabilityGroups129 TABLE
+(
+    GroupId uniqueidentifier PRIMARY KEY
 );
 
 DECLARE @DatabaseName129 sysname;
+DECLARE @DatabaseStateDesc129 nvarchar(60);
 DECLARE @Sql129 nvarchar(max);
 
+/*
+    The is_contained column exists only on SQL Server 2022 and later.
+    Dynamic SQL prevents compilation failure on older versions.
+*/
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.all_columns AS all_columns
+    WHERE all_columns.object_id =
+          OBJECT_ID(N'sys.availability_groups')
+      AND all_columns.name = N'is_contained'
+)
+BEGIN
+    INSERT INTO @ContainedAvailabilityGroups129
+    (
+        GroupId
+    )
+    EXEC sys.sp_executesql N'
+        SELECT
+            availability_groups.group_id
+        FROM sys.availability_groups AS availability_groups
+        WHERE availability_groups.is_contained = 1;';
+END;
+
+
 DECLARE db_cursor_129 CURSOR LOCAL FAST_FORWARD FOR
-SELECT name
-FROM sys.databases
-WHERE database_id > 4
-  AND state_desc = 'ONLINE'
-ORDER BY name;
+SELECT
+      databases.name
+    , databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states
+    AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id =
+       databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+LEFT JOIN sys.availability_databases_cluster
+    AS availability_databases_cluster
+    ON availability_databases_cluster.group_database_id =
+       databases.group_database_id
+LEFT JOIN @ContainedAvailabilityGroups129
+    AS contained_availability_groups
+    ON contained_availability_groups.GroupId =
+       availability_databases_cluster.group_id
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+
+  -- Exclude every database belonging to a contained AG,
+  -- including databases on the local primary replica.
+  AND contained_availability_groups.GroupId IS NULL
+
+  -- Include standalone databases and primary databases
+  -- belonging to ordinary availability groups.
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
 
 OPEN db_cursor_129;
-FETCH NEXT FROM db_cursor_129 INTO @DatabaseName129;
+
+FETCH NEXT FROM db_cursor_129
+INTO @DatabaseName129, @DatabaseStateDesc129;
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
     SET @Sql129 = N'
     SELECT
           ''129'' AS [Check ID]
-        , ''Orphaned Database Users'' AS [Check Name]
         , database_principals.name AS DatabaseUserName
         , database_principals.type_desc AS PrincipalType
         , (
             SELECT
-                  ' + QUOTENAME(@DatabaseName129,'''') + N' AS DatabaseName
-                , database_principals.authentication_type_desc AS AuthType
+                  ' + QUOTENAME(@DatabaseName129, '''') + N'
+                    AS DatabaseName
+                , database_principals.authentication_type_desc
+                    AS AuthType
                 , database_principals.create_date
                 , database_principals.modify_date
             FOR XML PATH(''AdditionalInfo''), TYPE
@@ -2411,12 +2666,14 @@ BEGIN
     WHERE server_principals.sid IS NULL
       AND database_principals.type IN (''S'', ''U'', ''G'')
       AND database_principals.authentication_type <> 0
-      AND database_principals.name NOT IN (''dbo'', ''guest'', ''INFORMATION_SCHEMA'', ''sys'');';
+      AND database_principals.name NOT IN
+          (''dbo'', ''guest'', ''INFORMATION_SCHEMA'', ''sys'');';
 
     INSERT INTO @Check129
     EXEC sys.sp_executesql @Sql129;
 
-    FETCH NEXT FROM db_cursor_129 INTO @DatabaseName129;
+    FETCH NEXT FROM db_cursor_129
+    INTO @DatabaseName129, @DatabaseStateDesc129;
 END
 
 CLOSE db_cursor_129;
@@ -2424,20 +2681,21 @@ DEALLOCATE db_cursor_129;
 
 SELECT
       [Check ID]
-    , [Check Name]
     , DatabaseUserName
     , PrincipalType
     , AdditionalInfo
 FROM @Check129
 ORDER BY
-    AdditionalInfo.value('(/AdditionalInfo/DatabaseName/text())[1]', 'sysname'),
-    DatabaseUserName;
+      AdditionalInfo.value(
+          '(/AdditionalInfo/DatabaseName/text())[1]',
+          'sysname'
+      )
+    , DatabaseUserName;
 
 GO
 
 SELECT
     '123' AS [Check ID],
-    'Databases with AUTO_CLOSE setting on' AS [Check Name],
     name AS DatabaseName,
     is_auto_close_on AS IsAutoCloseOn,
     (
@@ -2461,6 +2719,19 @@ DECLARE @MinorVersion INT = CAST(PARSENAME(@ProductVersion, 3) AS INT);
 DECLARE @AvailabilityGroupCount NVARCHAR(100) = N'Not applicable - requires SQL Server 2012 or later';
 DECLARE @ContainedAvailabilityGroupCount NVARCHAR(100) = N'Not applicable - requires SQL Server 2022 or later';
 DECLARE @DynamicSql NVARCHAR(MAX);
+DECLARE @SqlSafeAwsRdsCompat bit = 0;
+DECLARE @RdsAdminDatabasePresent bit = 0;
+DECLARE @RdsAdminLoginPresent bit = 0;
+
+IF DB_ID(N'rdsadmin') IS NOT NULL
+BEGIN
+    SET @RdsAdminDatabasePresent = 1;
+END;
+
+IF SUSER_ID(N'rdsa') IS NOT NULL
+BEGIN
+    SET @RdsAdminLoginPresent = 1;
+END;
 
 IF @MajorVersion >= 11
 BEGIN
@@ -2565,6 +2836,17 @@ SELECT 'Engine Edition',
            END)
 
 UNION ALL
+SELECT 'AWS RDS detected',
+       CONVERT(NVARCHAR(100),
+           CASE
+               WHEN @SqlSafeAwsRdsCompat = 1
+                AND @RdsAdminDatabasePresent = 1
+                AND @RdsAdminLoginPresent = 1
+               THEN 'Yes'
+               ELSE 'No'
+           END)
+
+UNION ALL
 SELECT 'SQL Server Service Start Time',
        CONVERT(NVARCHAR(100), sqlserver_start_time)
 FROM sys.dm_os_sys_info
@@ -2638,7 +2920,6 @@ WHERE is_user_process = 1;
 
 SELECT
     '800' AS [Check ID],
-    'System Overview' AS [Check Name],
     Item,
     Value
 FROM @SystemOverview
@@ -2650,13 +2931,51 @@ IF CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)),
              CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS varchar(50))) - 1) AS int) >= 16
 BEGIN
     DECLARE @sql nvarchar(max) = N'
+    ;WITH ContainedAvailabilityGroups AS
+    (
+        SELECT
+              availability_groups.name AS AvailabilityGroupName
+            , ISNULL(
+                  availability_group_listeners.dns_name
+                  + N'':''
+                  + CONVERT(nvarchar(10), availability_group_listeners.port),
+                  N''N/A''
+              ) AS ListenerName
+            , availability_group_listeners.is_conformant AS IsConformant
+        FROM sys.availability_groups
+        LEFT JOIN sys.availability_group_listeners
+            ON availability_group_listeners.group_id =
+               availability_groups.group_id
+        WHERE availability_groups.is_contained = 1
+    )
     SELECT
-        ''802'' AS [Check ID],
-        ''Contained Availability Groups'' AS [Check Name]
-		,	COUNT(*) AS ContainedAvailabilityGroupCount
-		FROM sys.availability_groups WHERE is_contained = 1
-		GROUP BY is_contained
-		'
+          ''802'' AS [Check ID]
+        , AvailabilityGroupName
+        , ListenerName
+        , (
+              SELECT
+                    IsConformant
+              FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    FROM ContainedAvailabilityGroups
+
+    UNION ALL
+
+    SELECT
+          ''802'' AS [Check ID]
+        , N''No Contained Availability Groups found''
+        , N''N/A''
+        , (
+              SELECT
+                    CONVERT(bit, NULL) AS IsConformant
+              FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM ContainedAvailabilityGroups
+    )
+    ORDER BY AvailabilityGroupName;'
     EXEC sys.sp_executesql @sql;
 END
 
@@ -2664,7 +2983,6 @@ GO
 
 SELECT
     '806' AS [Check ID],
-    'Outstanding configuration changes' AS [Check Name],
     name AS ConfigurationName,
     value AS ConfiguredValue,
     (
@@ -2702,6 +3020,7 @@ $AllowedCheckIds = @(
     '002'
     '003'
     '004'
+    '006'
     '028'
     '031'
     '034'
@@ -2732,28 +3051,29 @@ $Catalog = @(
     [pscustomobject]@{ 'Check ID' = '002'; SectionID = '6'; Section = 'Communication Security' },
     [pscustomobject]@{ 'Check ID' = '003'; SectionID = '6'; Section = 'Communication Security' },
     [pscustomobject]@{ 'Check ID' = '004'; SectionID = '6'; Section = 'Communication Security' },
+    [pscustomobject]@{ 'Check ID' = '006'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
     [pscustomobject]@{ 'Check ID' = '008'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
     [pscustomobject]@{ 'Check ID' = '010'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
     [pscustomobject]@{ 'Check ID' = '011'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
-    [pscustomobject]@{ 'Check ID' = '015'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
-    [pscustomobject]@{ 'Check ID' = '026'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
-    [pscustomobject]@{ 'Check ID' = '027'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
+    [pscustomobject]@{ 'Check ID' = '015'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
+    [pscustomobject]@{ 'Check ID' = '026'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '027'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
     [pscustomobject]@{ 'Check ID' = '028'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '031'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '034'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '036'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '038'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '046'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '050'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '050'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
     [pscustomobject]@{ 'Check ID' = '059'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
     [pscustomobject]@{ 'Check ID' = '069'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
     [pscustomobject]@{ 'Check ID' = '072'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '078'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '078'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
     [pscustomobject]@{ 'Check ID' = '079'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
-    [pscustomobject]@{ 'Check ID' = '113'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '113'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
     [pscustomobject]@{ 'Check ID' = '123'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '129'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '155'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '129'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '155'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
     [pscustomobject]@{ 'Check ID' = '800'; SectionID = '0'; Section = 'Information' },
     [pscustomobject]@{ 'Check ID' = '802'; SectionID = '0'; Section = 'Information' },
     [pscustomobject]@{ 'Check ID' = '806'; SectionID = '0'; Section = 'Information' }
@@ -2764,6 +3084,7 @@ $Rules = [ordered]@{
     '002' = @{ Method = 'column_equals'; Column = 'IsIntegratedSecurityOnly'; ExpectedValue = 0; Severity = 'OBSERVE' }
     '003' = @{ Method = 'threshold_max'; Column = 'SqlAuthenticationSessionPercent'; Limit = 10; Severity = 'WARNING' }
     '004' = @{ Method = 'threshold_max_stacked'; Column = 'NtlmAuthenticationSessionPercent'; Thresholds = @(@{ GreaterThan = 0; Severity = 'OBSERVE' }, @{ GreaterThanOrEqual = 10; Severity = 'WARNING' }, @{ GreaterThan = 30; Severity = 'FAIL' }) } # NTLM Authentication usage
+    '006' = @{ Method = 'rows_exist'; Severity = 'FAIL' }
     '008' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' }
     '010' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } 
     '011' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
@@ -2794,13 +3115,15 @@ $RecommendationLookup = @{
     '800' = [pscustomobject]@{ CheckName = 'System Overview'; Recommendation = @'
 Make sure to keep SQL Server patched with the latest Security Updates. If you are using Contained Availability Groups, ensure to assess them in addition to the host.
 '@.Trim(); ReferenceTitle = 'Latest updates and version history for SQL Server'; ReferenceUrl = 'https://learn.microsoft.com/en-us/troubleshoot/sql/releases/download-and-install-latest-updates'; ReferenceTitle2 = 'What is a contained availability group?'; ReferenceUrl2 = 'https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/contained-availability-groups-overview?view=sql-server-ver17' }
-    '802' = [pscustomobject]@{ CheckName = 'Contained AGs present'; Recommendation = @'
+    '802' = [pscustomobject]@{ CheckName = 'Contained Availability Groups'; Recommendation = @'
 If contained availability groups are present, review the security and operational implications carefully, including identity handling to ensure that the Contained Availability Group is monitored and secured at the same level as the host.
+
+Important: Contained availability groups maintain security principals and metadata separately from the SQL Server instance. Checks that depend on this security context, such as identifying orphaned database users, must be executed through the contained availability group context to produce accurate results.
 '@.Trim(); ReferenceTitle = 'Why you should use SQL Server contained availability groups to save time - and why consultants may not tell you about them'; ReferenceUrl = 'https://andreas-wolter.com/en/2504_sqlserver_contained_availability_groups/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '806' = [pscustomobject]@{ CheckName = 'Outstanding configuration changes'; Recommendation = @'
 There are outstanding configuration changes pending. This means that some settings will only take effect after a server restart or after executing the RECONFIGURE statement. Ensure that you understand which settings will change and validate their impact before they are applied.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '002' = [pscustomobject]@{ CheckName = 'Authentication mode'; Recommendation = @'
+    '002' = [pscustomobject]@{ CheckName = 'Authentication Mode'; Recommendation = @'
 SQL Authentication increases the attack surface because credentials must be stored, transmitted, and managed separately from the operating system. Whenever possible, prefer Windows Authentication, which integrates with Active Directory and supports centralized identity management, password policies, and stronger authentication mechanisms. If applications currently require SQL Authentication, work with the application vendor to enable support for Windows Authentication or modern identity solutions. Where SQL logins must remain in use, enforce strong password policies, disable unused accounts, and regularly monitor login activity.
 '@.Trim(); ReferenceTitle = 'Choose an authentication mode'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/choose-an-authentication-mode?view=sql-server-ver17'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '003' = [pscustomobject]@{ CheckName = 'SQL Authentication usage'; Recommendation = @'
@@ -2809,6 +3132,9 @@ SQL Authentication increases the attack surface because credentials must be stor
     '004' = [pscustomobject]@{ CheckName = 'NTLM Authentication usage'; Recommendation = @'
 The scan observed connections which are still using NTLM. NTLM is on a deprecation path and provides weaker security compared to modern alternatives such as Kerberos. Reduce and phase out NTLM wherever possible by identifying affected clients and migrating them to Kerberos-based authentication.
 '@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '006' = [pscustomobject]@{ CheckName = 'SQL Logins without password policy enforcement'; Recommendation = @'
+One or more SQL Server logins are configured without password policy enforcement. This increases the risk of weak, reused, or non-compliant passwords being accepted for SQL authentication. Review the affected logins with the application owner or responsible user. Where SQL authentication is still required, set a compliant password and enable password policy enforcement using `CHECK_POLICY = ON`. Exceptions should be documented and limited to cases with a clear justification.
+'@.Trim(); ReferenceTitle = 'SQL Server - Password Policy'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/password-policy'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '028' = [pscustomobject]@{ CheckName = 'Databases with Trustworthy property set'; Recommendation = @'
 The assessment identified user databases with the TRUSTWORTHY property set to ON. This setting represents a significant security risk and is commonly classified as a high-severity finding. When a database is marked as TRUSTWORTHY, SQL Server implicitly trusts its contents, which can enable privilege escalation and unauthorized access to server-level resources. Determine the technical reason for this configuration and evaluate safer alternatives, such as module signing (code signing), to achieve the same functionality without relying on TRUSTWORTHY.
 '@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = 'TRUSTWORTHY database property'; ReferenceUrl2 = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/trustworthy-database-property?view=sql-server-ver17' }
@@ -2818,19 +3144,19 @@ The server-level cross-database ownership chaining setting is enabled. This conf
     '034' = [pscustomobject]@{ CheckName = 'XP_cmdshell setting'; Recommendation = @'
 xp_cmdshell can be abused for command execution and lateral movement and should only be enabled temporarily when absolutely necessary. Disable it by default and document any approved exception with compensating controls.
 '@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '036' = [pscustomobject]@{ CheckName = 'Ad hoc distributed queries setting'; Recommendation = @'
+    '036' = [pscustomobject]@{ CheckName = 'Ad Hoc distributed queries setting'; Recommendation = @'
 The Ad Hoc Distributed Queries setting allows users to access external data sources directly using functions such as OPENROWSET and OPENDATASOURCE, significantly increasing the attack surface. It enables arbitrary connections to external or untrusted systems, facilitates data exfiltration, and may allow privilege escalation or code execution through vulnerable OLE DB providers under the SQL Server service account. In the event of compromise, it can also be used as a pivot point to access other systems on the network. Where external access is needed, prefer controlled mechanisms such as linked servers with defined security contexts. Disable this setting unless there is a clear and documented technical requirement. Due to the increased risk, consider isolating databases that require this setting on a dedicated SQL Server instance.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '038' = [pscustomobject]@{ CheckName = 'OLE Automation Procedures setting'; Recommendation = @'
 The OLE Automation Procedures setting allows Transact-SQL code to instantiate COM objects and interact with external Windows components. Enabling this feature represents a significant security risk, as it can be used by an attacker with database access to execute arbitrary commands, modify the registry, or read and write files - effectively bypassing standard SQL Server security boundaries and enabling privilege escalation under the SQL Server service account. Disable OLE Automation Procedures unless there is a strict and documented requirement. Where external interaction is needed, prefer safer alternatives such as SQL Server Agent jobs, CLR integration with strict permission sets, or application-layer logic outside the database. Ensure any required functionality is implemented using controlled, auditable mechanisms rather than direct OS-level access from within SQL Server.
 '@.Trim(); ReferenceTitle = 'OLE Automation stored procedures (Transact-SQL)'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/ole-automation-stored-procedures-transact-sql?view=sql-server-ver17'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '050' = [pscustomobject]@{ CheckName = 'Number of ErrorLogs kept'; Recommendation = @'
+    '050' = [pscustomobject]@{ CheckName = 'Number of Error Logs kept'; Recommendation = @'
 Fewer than 30 SQL Server error logs are being retained. Increase the setting to 90 to improve the available history for security investigations, troubleshooting, and forensic review. In practice, there is no downside for having one ErrorLog per day with 90 days history.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '072' = [pscustomobject]@{ CheckName = 'Database Owner sysadmin'; Recommendation = @'
 Some databases are owned by logins with sysadmin privileges. This can be abused by users with elevated permissions within the database to escalate privileges to the server level and should therefore be avoided. Use a dedicated, low-privileged login as the database owner instead. If using sa as a consistently available owner, ensure the associated risks are fully understood - especially in combination with settings such as TRUSTWORTHY or features that execute code as the database owner.
 '@.Trim(); ReferenceTitle = 'SQL Server Database Ownership: survey results & recommendations'; ReferenceUrl = 'https://andreas-wolter.com/en/sql-server-database-ownership-survey-results-recommendations/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '078' = [pscustomobject]@{ CheckName = 'Database Owner Windows account'; Recommendation = @'
+    '078' = [pscustomobject]@{ CheckName = 'Database Owner Windows Account'; Recommendation = @'
 Some databases are owned by Windows accounts. This can cause issues after restores to different servers or if the associated login is removed, and it often indicates weaknesses in database deployment processes. Ensure that all databases are owned by a consistently available account on every server.
 '@.Trim(); ReferenceTitle = 'SQL Server Database Ownership: survey results & recommendations'; ReferenceUrl = 'https://andreas-wolter.com/en/sql-server-database-ownership-survey-results-recommendations/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '123' = [pscustomobject]@{ CheckName = 'Databases with AUTO_CLOSE setting on'; Recommendation = @'
@@ -2872,7 +3198,7 @@ The assessment found orphaned Windows logins that no longer exist in Active Dire
     '059' = [pscustomobject]@{ CheckName = 'Security Auditing minimal setup'; Recommendation = @'
 Security auditing is insufficiently configured. At a minimum, monitor failed login attempts, permission changes, role membership changes, and other security-relevant activities. Refer to established guidance for a comprehensive set of audit actions to ensure adequate visibility into security events.
 '@.Trim(); ReferenceTitle = 'Recommendation for Security Auditing for databases - with example for Microsoft SQL Server'; ReferenceUrl = 'https://andreas-wolter.com/en/202507_recommended_security_auditing_databases_sql_server/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
-    '069' = [pscustomobject]@{ CheckName = ''; Recommendation = @'
+    '069' = [pscustomobject]@{ CheckName = 'Basic Login-Failure logging status'; Recommendation = @'
     Failed Logins are not Logged in the ErrorLog. Unless they are captured in an Audit, this should always be on.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
 }
@@ -2883,7 +3209,7 @@ $EmbeddedDetailsTemplateHtml = @'
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="sqlaw" content="2026sql03">
+<meta name="sqlaw" content="2026sql04">
 <title>SQL Server Security Assessment Community Edition</title>
 <style>
 body{font-family:Segoe UI, Arial, sans-serif;background:#f4f7f6;margin:40px;color:#333;}
@@ -2900,7 +3226,7 @@ h1{margin:0;color:#2c3e50;font-size:2rem;line-height:1.1;}
 .meta-title{font-size:11px;text-transform:uppercase;color:#667085;margin-bottom:4px}
 .meta-value{font-size:14px;font-weight:600;color:#1f2937;word-break:break-word;overflow-wrap:anywhere}
 
-.visuals-panel,.controls,.detail-section{background:white;box-shadow:0 2px 5px rgba(0,0,0,0.1);}
+.visuals-panel,.controls,.detail-section,.category-summary-panel{background:white;box-shadow:0 2px 5px rgba(0,0,0,0.1);}
 .visuals-panel{margin-bottom:20px;padding:16px;page-break-inside:avoid;break-inside:avoid;}
 .visuals-title{font-size:1rem;font-weight:700;color:#2c3e50;margin:0 0 14px 0;}
 
@@ -2925,6 +3251,23 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 .filter-btn{font-weight:600;}
 .filter-btn.active{background:#2c3e50;color:#fff;border-color:#2c3e50;}
 
+.category-summary-panel{padding:16px;margin-bottom:20px;page-break-inside:avoid;break-inside:avoid;}
+.category-summary-title{font-size:1rem;font-weight:700;color:#2c3e50;margin:0 0 12px 0;}
+.category-summary-table-wrap{overflow-x:auto;}
+.category-summary-table{width:100%;min-width:560px;border-collapse:collapse;}
+.category-summary-table th{background:#34495e;color:white;padding:8px;border:1px solid #ddd;text-align:left;}
+.category-summary-table td{padding:8px;border:1px solid #ddd;background:#fff;}
+.category-summary-table th:not(:first-child),.category-summary-table td:not(:first-child){text-align:center;}
+.category-summary-table td:first-child{font-weight:600;color:#2c3e50;}
+.category-summary-count{font-weight:700;color:#111827;}
+.category-summary-count.status-FAIL{color:#dc3545;}
+.category-summary-count.outcome-zero{color:#111827;}
+.category-summary-count.indicator-count{font-weight:400;}
+.outcome-definitions{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb;}
+.outcome-definition{display:flex;gap:8px;align-items:flex-start;font-size:.85rem;color:#4b5563;line-height:1.35;}
+.outcome-definition-label{flex:0 0 auto;min-width:72px;text-align:center;padding:3px 7px;border-radius:4px;color:#fff;font-weight:700;font-size:.76rem;line-height:1.2;}
+.outcome-definition-label.outcome-WARNING{color:#212529;}
+
 .detail-section{padding:18px;margin-bottom:20px;}
 .compact-summary-table{width:100%;border-collapse:collapse;cursor:pointer;}
 .detail-section-static .compact-summary-table{cursor:default;}
@@ -2947,6 +3290,33 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 .additional-info-cell{min-width:280px;}
 
 .badge{padding:4px 8px;border-radius:4px;color:white;font-weight:bold;}
+.managed-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-left: 0.45rem;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.3;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+.managed-label-aws {
+    color: #1f3a5f;
+    background: #eef5ff;
+    border: 1px solid #b8d4f5;
+}
+
+.managed-label-dot {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: #ff9900;
+    display: inline-block;
+}
 .outcome-PASS,.section-dot.outcome-PASS{background:#28a745;}
 .outcome-OBSERVE,.section-dot.outcome-OBSERVE{background:#0ea5e9;}
 .outcome-FAIL,.section-dot.outcome-FAIL{background:#dc3545;}
@@ -2973,7 +3343,7 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 @media print {
     body{background:#fff;margin:20px 24px;}
     .page{min-height:auto;}
-    .visuals-panel,.controls,.detail-section,.meta-box{box-shadow:none;}
+    .visuals-panel,.controls,.detail-section,.category-summary-panel,.meta-box{box-shadow:none;}
     .visuals-panel{page-break-inside:avoid;break-inside:avoid;}
     .chart-bar,.chart-track,.footer-logo{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
     .report-footer{position:fixed;bottom:0;left:0;right:0;padding:10px 24px 2px;background:#fff;}
@@ -3222,7 +3592,7 @@ catch {
 [xml]$XAML = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SQL Server Security Assessment - Community Edition (2026.3)" Width="560" Height="320"
+        Title="SQL Server Security Assessment - Community Edition ($ReleaseVersion)" Width="560" Height="320"
         WindowStartupLocation="CenterScreen" Background="#F4F7F6" ResizeMode="NoResize"
         SizeToContent="Height" MinWidth="560">
     <Grid Margin="12">
@@ -3306,6 +3676,22 @@ catch {
                             <TextBlock Text="Certificate:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
                             <CheckBox Name="TrustCert" Grid.Column="1" Content="Trust server certificate" FontSize="11" VerticalAlignment="Center"/>
                         </Grid>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Compatibility:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="SkipSecurityAdminChecks" Grid.Column="1" Content="Skip checks that require securityadmin-role membership" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="AwsRdsCompatChecks" Grid.Column="1" Content="AWS RDS Compat. Checks only" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
                     </StackPanel>
                 </Border>
             </Expander>
@@ -3337,6 +3723,8 @@ $UsernameInput    = $Window.FindName('UsernameInput')
 $PasswordInput    = $Window.FindName('PasswordInput')
 $EncryptOption    = $Window.FindName('EncryptOption')
 $TrustCert        = $Window.FindName('TrustCert')
+$SkipSecurityAdminChecks = $Window.FindName('SkipSecurityAdminChecks')
+$AwsRdsCompatChecks = $Window.FindName('AwsRdsCompatChecks')
 $ConnectBtn       = $Window.FindName('ConnectBtn')
 $CancelBtn        = $Window.FindName('CancelBtn')
 $TestBtn          = $Window.FindName('TestBtn')
@@ -3371,7 +3759,7 @@ $Window.Add_ContentRendered({
 
 # --- Button actions ---
 $ConnectBtn.Add_Click({
-    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
     $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
 
     if ($validationMessage) {
@@ -3385,12 +3773,14 @@ $ConnectBtn.Add_Click({
     $script:Password      = $dialogInput.Password
     $script:EncryptOption = $dialogInput.EncryptOption
     $script:TrustCert     = $dialogInput.TrustCert
+    $script:SkipChecks    = @($dialogInput.SkipChecks)
+    $script:AwsRdsCompat = [bool]$dialogInput.AwsRdsCompat
     $Window.DialogResult = $true
     $Window.Close()
 })
 
 $TestBtn.Add_Click({
-    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
     $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
 
     if ($validationMessage) {
@@ -3469,6 +3859,7 @@ if ($ConsoleOnly) {
     $Password      = $securePass
     $EncryptOption = $Encrypt
     $TrustCert     = $TrustServerCert.IsPresent
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $SkipChecks)
 }
 else {
     Write-Log '--- Phase: Logon dialog ---'
@@ -3485,14 +3876,23 @@ else {
     $Password      = $script:Password
     $EncryptOption = [string]$script:EncryptOption
     $TrustCert     = [bool]$script:TrustCert
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $script:SkipChecks)
+    $AwsRdsCompat = [bool]$script:AwsRdsCompat
 }
 
+if ($AwsRdsCompat) {
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks @($ActiveSkipChecks + '046'))
+}
 
 Write-Log "--- Phase: Connecting to SQL Server ---"
 Write-LogValue 'Target SQL Server' $SqlServer
 Write-LogValue 'Authentication'    $AuthMethod
 Write-LogValue 'Encryption'        $EncryptOption
 Write-LogValue 'Trust server cert' $TrustCert
+Write-LogValue 'AWS RDS compat'    ([bool]$AwsRdsCompat)
+if ($ActiveSkipChecks.Count -gt 0) {
+    Write-LogValue 'Skipped checks' ($ActiveSkipChecks -join ', ')
+}
 
 $SqlServerDisplay = Format-ServerName $SqlServer
 
@@ -3507,8 +3907,24 @@ $DetailsPath    = Join-Path $ResultsFolder ("{0}_SQL_Security_Assessment_Communi
 
 
 # --- USE EMBEDDED SQL SOURCE ---
-$SqlText = $EmbeddedAssessmentSql
+$SqlText = Remove-SkippedAssessmentSqlBatches -SqlText $EmbeddedAssessmentSql -SkipCheckIds $ActiveSkipChecks
 
+if ($AwsRdsCompat) {
+    $SqlText = $SqlText.Replace(
+        'DECLARE @SqlSafeExcludeModelDatabase bit = 0;',
+        'DECLARE @SqlSafeExcludeModelDatabase bit = 1;'
+    )
+    $SqlText = $SqlText.Replace(
+        'DECLARE @SqlSafeAwsRdsCompat bit = 0;',
+        'DECLARE @SqlSafeAwsRdsCompat bit = 1;'
+    )
+}
+
+if ($ActiveSkipChecks.Count -gt 0) {
+    $AllowedCheckIds = @($AllowedCheckIds | Where-Object { (Normalize-CheckId $_) -notin $ActiveSkipChecks })
+    $AllowedCheckIdLookup = @{}
+    foreach ($id in $AllowedCheckIds) { $AllowedCheckIdLookup[$id] = $true }
+}
 
 # --- RUN SQL ---
 Write-Log '--- Phase: SQL checks execution ---'
@@ -3603,6 +4019,23 @@ if ($check026PermissionExclusions.Count -gt 0) {
         Write-Log ("Check 026 permission exclusions removed {0} row(s): {1}" -f $excludedCheck026RowCount, ($excludedCheck026Labels -join ', '))
     }
 }
+if ($AwsRdsCompat) {
+    $rowCountBeforeCheck028Exclusions = $AllRows.Count
+    $AllRows = @(
+        $AllRows | Where-Object {
+            $checkId = Get-RowCheckId $_
+            if ($checkId -ne '028') { return $true }
+            if (-not $_.PSObject.Properties['DatabaseName']) { return $true }
+
+            return ([string]$_.DatabaseName -ne 'rdsadmin')
+        }
+    )
+
+    $excludedCheck028RowCount = $rowCountBeforeCheck028Exclusions - $AllRows.Count
+    if ($excludedCheck028RowCount -gt 0) {
+        Write-Log ("Check 028 AWS RDS compatibility exclusions removed {0} row(s): rdsadmin" -f $excludedCheck028RowCount)
+    }
+}
 $RowsWithoutCheckId = @($AllRows | Where-Object { [string]::IsNullOrWhiteSpace((Get-RowCheckId $_)) })
 $RowsWithCheckId = @($AllRows | Where-Object { $id = Get-RowCheckId $_; -not [string]::IsNullOrWhiteSpace($id) -and $AllowedCheckIdLookup.ContainsKey($id) })
 
@@ -3640,6 +4073,22 @@ try {
         $RowsByCheckId[$checkId].Add($row) | Out-Null
     }
 
+    $IsAwsRdsInstance = Test-AwsRdsInstanceFromRows -Rows $RowsWithCheckId
+    Write-LogValue 'AWS RDS detected' ([bool]$IsAwsRdsInstance)
+
+    $AwsManagedCheckIds = @(
+        '028','031','034','036','038',
+        '050', '072','078','155',
+        '008','079','010','069'
+    )
+    $AwsManagedCheckIdLookup = @{}
+    foreach ($awsManagedCheckId in $AwsManagedCheckIds) {
+        $normalizedAwsManagedCheckId = Normalize-CheckId $awsManagedCheckId
+        if (-not [string]::IsNullOrWhiteSpace($normalizedAwsManagedCheckId)) {
+            $AwsManagedCheckIdLookup[$normalizedAwsManagedCheckId] = $true
+        }
+    }
+
     $ProcessedData = @()
 
     foreach ($allowedCheckId in $AllowedCheckIds) {
@@ -3660,18 +4109,11 @@ try {
             }
         }
 
-        $checkName = ''
-        if ($rows.Count -gt 0) {
-            $checkName = Get-RowCheckName $rows[0]
+        if (-not $RecommendationLookup.ContainsKey($checkId) -or [string]::IsNullOrWhiteSpace([string]$RecommendationLookup[$checkId].CheckName)) {
+            throw "Missing CheckName in RecommendationLookup for check $checkId."
         }
 
-        if ([string]::IsNullOrWhiteSpace($checkName) -and $RecommendationLookup.ContainsKey($checkId)) {
-            $checkName = [string]$RecommendationLookup[$checkId].CheckName
-        }
-
-        if ([string]::IsNullOrWhiteSpace($checkName)) {
-            $checkName = "Check $checkId"
-        }
+        $checkName = [string]$RecommendationLookup[$checkId].CheckName
 
         $applicability = Get-CheckApplicability -CheckId $checkId -SqlServerMajorVersion $SqlServerMajorVersion
 
@@ -3692,12 +4134,24 @@ try {
             Section   = $section
             SectionID = $sectionId
             Rows      = $rows
+            IsAwsManaged = ($IsAwsRdsInstance -and $AwsManagedCheckIdLookup.ContainsKey($checkId))
         }
     }
 
     $ProcessedData = @(
         $ProcessedData |
-        Sort-Object SectionID, @{ Expression = { [int]([string]$_.CheckId -as [int]) } }, CheckId
+        Sort-Object SectionID,
+            @{
+                Expression = {
+                    if ([int]$_.SectionID -eq 0) {
+                        return ('{0:D6}' -f [int]$_.CheckId)
+                    }
+
+                    return ([string]$_.CheckName).ToUpperInvariant()
+                }
+            },
+            @{ Expression = { [int]([string]$_.CheckId -as [int]) } },
+            CheckId
     )
 
     Write-LogValue 'Processed checks' (@($ProcessedData).Count)
@@ -3732,6 +4186,78 @@ $DetailSectionsGrouped = @(
     Sort-Object { [int]($_.Group[0].SectionID) }, Name
 )
 
+$CategorySummaryRows = @()
+foreach ($sectionGroup in $DetailSectionsGrouped) {
+    $sectionName = [string]$sectionGroup.Name
+    $items = @($sectionGroup.Group)
+    $safeSectionName = [System.Net.WebUtility]::HtmlEncode($sectionName)
+    $passCount = @($items | Where-Object { $_.Outcome -eq 'PASS' }).Count
+    $observeCount = @($items | Where-Object { $_.Outcome -eq 'OBSERVE' }).Count
+    $warningCount = @($items | Where-Object { $_.Outcome -eq 'WARNING' }).Count
+    $failCount = @($items | Where-Object { $_.Outcome -eq 'FAIL' }).Count
+    $infoCount = @($items | Where-Object { $_.Outcome -eq 'INFO' }).Count
+
+    $totalCount = $items.Count
+    $defaultCountClass = 'category-summary-count outcome-zero'
+    $failCountClass = if ($failCount -gt 0) { 'category-summary-count status-FAIL' } else { 'category-summary-count outcome-zero' }
+    $passDisplay = [string]$passCount
+    $observeDisplay = [string]$observeCount
+    $warningDisplay = [string]$warningCount
+    $failDisplay = [string]$failCount
+
+    if ($sectionName -eq 'Information') {
+        $passDisplay = '-'
+        $observeDisplay = '-'
+        $warningDisplay = '-'
+        $failDisplay = '-'
+        $failCountClass = $defaultCountClass
+    }
+
+    $CategorySummaryRows += @"
+        <tr>
+            <td>$safeSectionName</td>
+            <td><span class='$defaultCountClass'>$infoCount</span></td>
+            <td><span class='$defaultCountClass'>$passDisplay</span></td>
+            <td><span class='$defaultCountClass'>$observeDisplay</span></td>
+            <td><span class='$defaultCountClass'>$warningDisplay</span></td>
+            <td><span class='$failCountClass'>$failDisplay</span></td>
+            <td><span class='$defaultCountClass indicator-count'>$totalCount</span></td>
+        </tr>
+"@
+}
+
+$CategorySummaryBodyHtml = $CategorySummaryRows -join "`r`n"
+$CategorySummaryHtml = @"
+<section class='category-summary-panel' aria-label='Checks and status counts by category'>
+    <div class='category-summary-title'>Checks and Status by Category</div>
+    <div class='category-summary-table-wrap'>
+        <table class='category-summary-table'>
+            <thead>
+                <tr>
+                    <th>Category</th>
+                    <th>INFO</th>
+                    <th>PASS</th>
+                    <th>OBSERVE</th>
+                    <th>WARNING</th>
+                    <th>FAIL</th>
+                    <th>Indicators</th>
+                </tr>
+            </thead>
+            <tbody>
+$CategorySummaryBodyHtml
+            </tbody>
+        </table>
+    </div>
+    <div class='outcome-definitions'>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-INFO'>INFO</span><span>Context only. Not a security finding.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-PASS'>PASS</span><span>The assessed condition met the expected rule.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-OBSERVE'>OBSERVE</span><span>Review or monitor. Impact depends on environment.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-WARNING'>WARNING</span><span>Security-relevant finding. Review and likely remediate.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-FAIL'>FAIL</span><span>Clear security risk. Prompt attention required.</span></div>
+    </div>
+</section>
+"@
+
 $DetailBlocks = @()
 
 foreach ($sectionGroup in $DetailSectionsGrouped) {
@@ -3744,6 +4270,10 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
     foreach ($item in $sectionGroup.Group) {
         $safeCheckId = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckId)
         $safeCheckName = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckName)
+        $managedLabelHtml = ''
+        if ($item.PSObject.Properties['IsAwsManaged'] -and [bool]$item.IsAwsManaged) {
+            $managedLabelHtml = '<span class="managed-label managed-label-aws"><span class="managed-label-dot"></span>AWS managed</span>'
+        }
         $outcome = [string]$item.Outcome
         $outcomeBadge = Get-OutcomeBadgeHtml -Outcome $outcome
         $detailTable = Convert-DataRowsToHtmlTable -Rows $item.Rows
@@ -3755,7 +4285,7 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
     <table class='compact-summary-table'>
         <tr>
             <td class='summary-check-id'>($safeCheckId)</td>
-            <td class='summary-check-name'>$safeCheckName</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
             <td class='summary-check-outcome'>$outcomeBadge</td>
         </tr>
     </table>
@@ -3769,7 +4299,7 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
     <table class='compact-summary-table'>
         <tr>
             <td class='summary-check-id'>($safeCheckId)</td>
-            <td class='summary-check-name'>$safeCheckName</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
             <td class='summary-check-outcome'>$outcomeBadge</td>
         </tr>
     </table>
@@ -3784,7 +4314,7 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
 
 $DetailsHeaderHtml = ''
 $DetailsNavigationHtml = ''
-$DetailsBodyHtml = $DetailBlocks -join "`r`n"
+$DetailsBodyHtml = @($CategorySummaryHtml, ($DetailBlocks -join "`r`n")) -join "`r`n"
 
 $DetailsTemplateHtml = $EmbeddedDetailsTemplateHtml
 
@@ -3825,22 +4355,4360 @@ if ($script:WriteLogEnabled -and -not [string]::IsNullOrWhiteSpace($script:LogPa
 }
 Write-Log "Assessment completed successfully."
 Write-Log '=== Assessment complete ==='
+<#
+.SYNOPSIS
+    SQL Server Security Assessment Collector - Community Edition
+
+.DESCRIPTION
+    Logic & Engine by Andreas Wolter (MCSM). 
+    This script orchestrates the collection of security metadata and 
+    generates the High-Level Security Indicators HTML report.
+
+.PARAMETER ConsoleOnly
+    Skips the WPF logon dialog and runs in command-line mode.
+    When ConsoleOnly is used, -SqlInstance is required.
+    -SqlUser and -SqlPass are only required when -Auth SQL is used.
+    Supplying -SqlInstance or -WindowsCredential automatically enables console mode.
+    Aliases: -NoUI, -NonInteractive
+
+.PARAMETER SqlInstance
+    The SQL Server instance to assess (required with -ConsoleOnly).
+
+.PARAMETER Auth
+    Authentication method: Windows (default) or SQL.
+
+.PARAMETER SqlUser
+    SQL login name. Required when -Auth SQL is used.
+
+.PARAMETER SqlPass
+    SQL login password as a SecureString. If omitted the script prompts interactively.
+    Pre-create with:  $pwd = Read-Host "SQL password" -AsSecureString
+
+.PARAMETER Encrypt
+    Connection encryption: Optional (default) or Mandatory.
+
+.PARAMETER TrustServerCert
+    Trusts the server certificate without validation.
+
+.PARAMETER SkipChecks
+    Check IDs to skip. Use this for checks that are incompatible with restricted platforms.
+    Example: -SkipChecks 046 skips the orphaned Windows logins check that requires securityadmin-role membership.
+
+.PARAMETER AwsRdsCompat
+    Enables AWS RDS compatibility mode. This adjusts the permission test, excludes the model database
+    from database-owner checks, excludes AWS RDS-managed rows such as rdsadmin where applicable,
+    and skips check 046 by design, independently of -SkipChecks.
+
+.PARAMETER WindowsCredential
+    Relaunches the assessment under an alternate Windows account via Start-Process -Credential.
+    Requires -SqlInstance. Only valid with -Auth Windows (default).
+
+.PARAMETER Verbose
+    Shows progress and operational messages in the console.
+
+.PARAMETER WriteLog
+    Writes diagnostic output to a .log file alongside the HTML report.
+    Alias: -LogFile. Independent of -Verbose.
+    -Verbose controls console output; -WriteLog controls file output.
+
+.NOTES
+    Version:  2026.4
+    Author:   Andreas Wolter (Sarpedon Quality Lab)
+    License:  Sarpedon Community License
+    Website:  https://www.SarpedonQualityLab.US/resources
+
+    Exit codes:
+    0 = completed successfully
+    2 = startup, parameter, credential, or assessment source validation failure
+    3 = SQL connection or SQL execution failure
+
+    DISCLAIMER:
+    This tool is provided "as is" for informational purposes only. It identifies 
+    high-level indicators of risk and does not constitute a comprehensive security 
+    audit, legal advice, or a guarantee of security. The author and Sarpedon 
+    Quality Lab LLC assume no liability for any inaccuracies, system impacts, 
+    or security incidents occurring after its use. Use at your own risk.
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -NoAutoOpenReport
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -NoAutoOpenReport
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
+
+.EXAMPLE
+    $pwd = Read-Host "SQL password" -AsSecureString
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser sa -SqlPass $pwd -NoAutoOpenReport
+
+.EXAMPLE
+    $pwd = Read-Host "SQL password" -AsSecureString
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser sa -SqlPass $pwd -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
+
+.EXAMPLE
+    $cred = Get-Credential
+    .\Get-SqlSafe.ps1 -ConsoleOnly -SqlInstance "SQLPROD01" -Auth Windows -WindowsCredential $cred
+
+.EXAMPLE
+    $cred = Get-Credential
+    .\Get-SqlSafe.ps1 -ConsoleOnly -SqlInstance "SQLPROD01" -Auth Windows -WindowsCredential $cred -Verbose -NoAutoOpenReport
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -SkipChecks 046 -NoAutoOpenReport
+
+.EXAMPLE
+    .\Get-SqlSafe.ps1 -SqlInstance "AWS-RDS-SQL01" -AwsRdsCompat -NoAutoOpenReport
+
+.EXAMPLE
+    $pwd = Read-Host "SQL password" -AsSecureString
+    .\Get-SqlSafe.ps1 -SqlInstance "AWS-RDS-SQL01" -Auth SQL -SqlUser assessment_user -SqlPass $pwd -AwsRdsCompat -Encrypt Mandatory -TrustServerCert -NoAutoOpenReport
+#>
+
+
+param(
+    [switch]$NoAutoOpenReport,
+    [switch]$Verbose,
+    [Alias('NoUI','NonInteractive')]
+    [switch]$ConsoleOnly,
+    [string]$SqlInstance,
+    [ValidateSet('Windows','SQL')]
+    [string]$Auth = 'Windows',
+    [string]$SqlUser,
+    [securestring]$SqlPass,
+    [ValidateSet('Optional','Mandatory')]
+    [string]$Encrypt = 'Optional',
+    [switch]$TrustServerCert,
+    [string[]]$SkipChecks = @(),
+    [switch]$AwsRdsCompat,
+    [System.Management.Automation.PSCredential]$WindowsCredential,
+    [Alias('LogFile')]
+    [switch]$WriteLog
+)
+
+# Capture verbose flag into $script: immediately so Write-Log works everywhere,
+# including inside WPF event-handler scriptblocks that run in child scopes.
+# $NoAutoOpenReport is used directly from the param() - no $script: copy needed
+# because the final check is in the main script body, not inside a scriptblock.
+$script:VerboseEnabled             = ($PSBoundParameters.ContainsKey('Verbose') -or $VerbosePreference -eq 'Continue')
+$script:WriteLogEnabled            = [bool]$WriteLog
+$script:LogPath                    = $null
+$script:LogBuffer                  = New-Object System.Collections.Generic.List[string]
+$script:SkipChecks                 = @($SkipChecks)
+$script:AwsRdsCompat               = [bool]$AwsRdsCompat
+$script:SecurityAdminRequiredCheckIds = @('046')
+$script:WindowsCredentialSpecified = $PSBoundParameters.ContainsKey('WindowsCredential')
+if (-not [string]::IsNullOrWhiteSpace($SqlInstance) -or $script:WindowsCredentialSpecified) { $ConsoleOnly = $true }
+$script:ConsoleOnly                = [bool]$ConsoleOnly
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [System.ConsoleColor]$Color = [System.ConsoleColor]::White,
+        [switch]$AlwaysShow,
+        [string]$FileMessage
+    )
+
+    $consoleTs   = Get-Date -Format 'HH:mm:ss'
+    $consoleLine = "[{0}] {1}" -f $consoleTs, $Message
+
+    if ($script:VerboseEnabled -or $AlwaysShow) {
+        Write-Host $consoleLine -ForegroundColor $Color
+    }
+
+    if (-not $script:WriteLogEnabled) { return }
+
+    $logText  = if ($PSBoundParameters.ContainsKey('FileMessage')) { $FileMessage } else { $Message }
+    $fileTs   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $fileLine = "[{0}] {1}" -f $fileTs, $logText
+
+    if ([string]::IsNullOrWhiteSpace($script:LogPath)) {
+        $script:LogBuffer.Add($fileLine) | Out-Null
+        return
+    }
+
+    try {
+        Add-Content -Path $script:LogPath -Value $fileLine -Encoding UTF8
+    }
+    catch {
+        if ($script:VerboseEnabled) {
+            Write-Host ("[{0}] Failed to write log file: {1}" -f $consoleTs, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+}
+
+
+function Start-SqlSafeLogFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not $script:WriteLogEnabled) { return }
+
+    try {
+        # If a log is already open, keep writing to it - path stays static.
+        if (-not [string]::IsNullOrWhiteSpace($script:LogPath)) { return }
+
+        $script:LogPath = $Path
+
+        $header = @(
+            '================================================================================'
+            'Get-SqlSafe Community Edition execution log'
+            ('Started: {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+            '================================================================================'
+        )
+        foreach ($line in $header) {
+            Add-Content -Path $script:LogPath -Value $line -Encoding UTF8
+        }
+        foreach ($line in $script:LogBuffer) {
+            Add-Content -Path $script:LogPath -Value $line -Encoding UTF8
+        }
+        $script:LogBuffer.Clear()
+        Write-Log ("Logging to: {0}" -f $script:LogPath) -Color Cyan -AlwaysShow
+    }
+    catch {
+        $script:LogPath = $null
+        Write-Host ("Failed to initialize log file: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+function Set-SqlSafeExitCode {
+    param([int]$ExitCode = 1)
+    $script:SqlSafeExitCode = $ExitCode
+    if ($ExitCode -ne 0) {
+        Write-Log ("Execution stopped with exit code {0}." -f $ExitCode) -AlwaysShow
+    }
+    if ($Host.Name -like '*ISE*') { return }
+    $host.SetShouldExit($ExitCode)
+}
+
+function Write-LogValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Label,
+        [AllowNull()]
+        [object]$Value
+    )
+    Write-Log ("{0,-17}: {1}" -f $Label, $Value)
+}
+
+function Write-AbortEntry {
+    if ($script:WriteLogEnabled -and -not [string]::IsNullOrWhiteSpace($script:LogPath)) {
+        Write-Log ("{0,-17}: {1}" -f 'Log file', $script:LogPath) -Color Cyan
+    }
+    Write-Log '=== Assessment aborted ===' -Color Red -AlwaysShow
+}
+
+function Stop-SqlSafeRun {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+        [int]$ExitCode = 2
+    )
+    Write-Log $Message -AlwaysShow
+    Set-SqlSafeExitCode $ExitCode
+    Write-AbortEntry
+    return
+}
+
+
+# --- CONFIGURATION ---
+$ScriptRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ReleaseVersion = '2026.4'
+$RequiredSql = 'b87feb6e932f3009a1c2f13d2fba9750c956d9cdd082e36c97eed5e3a923c927'
+$ResultsFolder = Join-Path $ScriptRoot 'Results'
+if (-not (Test-Path $ResultsFolder)) { New-Item -ItemType Directory -Path $ResultsFolder | Out-Null }
+
+Write-Log "=== Get-SqlSafe Community Edition v$ReleaseVersion ==="
+
+# --- Log file opened early so all output including relaunch and validation is captured ---
+if ($script:WriteLogEnabled -and [string]::IsNullOrWhiteSpace($script:LogPath)) {
+    $earlyLogPath = Join-Path $ResultsFolder ("SQL_Security_Assessment_CommunityEdition_{0}.log" -f (Get-Date -Format 'yyMMdd_HHmmss_fff'))
+    Start-SqlSafeLogFile -Path $earlyLogPath
+}
+
+# --- Optional Windows credential relaunch ---
+if ($script:WindowsCredentialSpecified) {
+
+    if ($null -eq $WindowsCredential) {
+        Write-Log '-WindowsCredential was specified, but no credential object was supplied. Execution has been stopped.' -AlwaysShow
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+        return
+    }
+
+    if ($Auth -ne 'Windows') {
+        Write-Log '-WindowsCredential can only be used with -Auth Windows. Execution has been stopped.' -AlwaysShow
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SqlInstance)) {
+        Write-Log '-WindowsCredential requires -SqlInstance. Alternate Windows credentials are only supported in console mode. Execution has been stopped.' -AlwaysShow
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+        return
+    }
+
+    function ConvertTo-PSQuotedString {
+        param([string]$Value)
+        if ($null -eq $Value) { return "''" }
+        return "'" + $Value.Replace("'", "''") + "'"
+    }
+
+    $childCommandParts = New-Object System.Collections.Generic.List[string]
+
+    $childCommandParts.Add('&')
+    $childCommandParts.Add((ConvertTo-PSQuotedString $PSCommandPath))
+    $childCommandParts.Add('-ConsoleOnly')
+    $childCommandParts.Add('-SqlInstance')
+    $childCommandParts.Add((ConvertTo-PSQuotedString $SqlInstance))
+    $childCommandParts.Add('-Auth')
+    $childCommandParts.Add('Windows')
+    $childCommandParts.Add('-Encrypt')
+    $childCommandParts.Add((ConvertTo-PSQuotedString $Encrypt))
+
+    if ($TrustServerCert) { $childCommandParts.Add('-TrustServerCert') }
+    if ($SkipChecks -and $SkipChecks.Count -gt 0) {
+        $childCommandParts.Add('-SkipChecks')
+        $childCommandParts.Add((ConvertTo-PSQuotedString ($SkipChecks -join ',')))
+    }
+    if ($AwsRdsCompat) { $childCommandParts.Add('-AwsRdsCompat') }
+    if ($NoAutoOpenReport) { $childCommandParts.Add('-NoAutoOpenReport') }
+    if ($script:VerboseEnabled) { $childCommandParts.Add('-Verbose') }
+    if ($WriteLog) { $childCommandParts.Add('-WriteLog') }
+
+    $childCommand   = $childCommandParts -join ' '
+    $encodedCommand = [Convert]::ToBase64String(
+        [System.Text.Encoding]::Unicode.GetBytes($childCommand)
+    )
+
+    Write-Log ("Relaunching assessment under Windows account: {0}" -f $WindowsCredential.UserName) -Color DarkGray -AlwaysShow
+
+    try {
+        $child = Start-Process powershell.exe `
+            -Credential $WindowsCredential `
+            -ArgumentList @(
+                '-NoProfile',
+                '-ExecutionPolicy', 'Bypass',
+                '-EncodedCommand', $encodedCommand
+            ) `
+            -WorkingDirectory $ScriptRoot `
+            -Wait `
+            -PassThru `
+            -ErrorAction Stop
+
+        if ($null -ne $child -and $child.ExitCode -ne 0) {
+            Write-Log ("Assessment process running as '{0}' exited with code {1}." -f $WindowsCredential.UserName, $child.ExitCode) -AlwaysShow
+            Set-SqlSafeExitCode $child.ExitCode
+        }
+    }
+    catch {
+        $msg1 = "Failed to relaunch assessment under Windows account '{0}'." -f $WindowsCredential.UserName
+        $msg2 = "The supplied credentials may be invalid, the account may be denied interactive logon, or the Secondary Logon service may be disabled."
+        $msg3 = "Error: {0}" -f $_.Exception.Message
+        Write-Log $msg1 -AlwaysShow -Color DarkGray
+        Write-Log $msg2 -AlwaysShow -Color DarkGray
+        Write-Log $msg3 -AlwaysShow -Color DarkGray
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+    }
+
+    return
+}
+
+Write-LogValue 'Script root' $ScriptRoot
+if ($script:VerboseEnabled) {
+    Write-Host ("[{0}] {1,-17}: {2}" -f (Get-Date -Format 'HH:mm:ss'), 'Process identity', [System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -ForegroundColor DarkGray
+}
+$AuthMethod                = 'Windows'
+$Username                  = ''
+$Password                  = [System.Security.SecureString]::new()
+$EncryptOption             = 'Optional'
+$TrustCert                 = $false
+$ActiveSkipChecks          = @($SkipChecks)
+
+$SqlServer                 = $null
+$Database                  = 'master'
+Write-LogValue 'Results dir' $ResultsFolder
+
+# --- FUNCTIONS ---
+function Show-UiMessage {
+    param(
+        [string]$Message,
+        [string]$Title = 'SQL Security Assessment',
+        [ValidateSet('Info','Warning','Error')]
+        [string]$Kind = 'Info'
+    )
+
+    if ($script:ConsoleOnly) {
+        switch ($Kind) {
+            'Warning' { Write-Warning $Message }
+            'Error'   { Write-Output  $Message }
+            default   { Write-Host    $Message }
+        }
+        return
+    }
+
+    try {
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+    }
+    catch {
+        Write-Output $Message
+        return
+    }
+
+    $image = switch ($Kind) {
+        'Warning' { [System.Windows.MessageBoxImage]::Warning }
+        'Error'   { [System.Windows.MessageBoxImage]::Error }
+        default   { [System.Windows.MessageBoxImage]::Information }
+    }
+
+    [System.Windows.MessageBox]::Show(
+        $Message,
+        $Title,
+        [System.Windows.MessageBoxButton]::OK,
+        $image
+    ) | Out-Null
+}
+
+function Get-DialogInput {
+    param($ServerInput, $AuthDropdown, $UsernameInput, $PasswordInput, $EncryptOption, $TrustCert, $SkipSecurityAdminChecks, $AwsRdsCompatChecks)
+
+    $dialogSkipChecks = New-Object System.Collections.Generic.List[string]
+    if ($SkipSecurityAdminChecks -and [bool]$SkipSecurityAdminChecks.IsChecked) {
+        foreach ($checkId in $script:SecurityAdminRequiredCheckIds) {
+            $dialogSkipChecks.Add($checkId) | Out-Null
+        }
+    }
+
+    [pscustomobject]@{
+        SqlServer     = $ServerInput.Text.Trim()
+        AuthMethod    = if ($AuthDropdown.SelectedItem -and [string]$AuthDropdown.SelectedItem.Tag -eq 'SQL') { 'SQL' } else { 'Windows' }
+        Username      = $UsernameInput.Text.Trim()
+        Password      = $PasswordInput.SecurePassword
+        EncryptOption = if ($EncryptOption.SelectedItem) { [string]$EncryptOption.SelectedItem.Tag } else { 'Optional' }
+        TrustCert     = [bool]$TrustCert.IsChecked
+        SkipChecks    = [string[]]$dialogSkipChecks.ToArray()
+        AwsRdsCompat  = ($AwsRdsCompatChecks -and [bool]$AwsRdsCompatChecks.IsChecked)
+    }
+}
+
+function Test-DialogInput {
+    param(
+        [Parameter(Mandatory)]$InputObject,
+        [switch]$ForConnect
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InputObject.SqlServer)) {
+        return 'Please enter a SQL Server name or instance.'
+    }
+
+    if ($InputObject.AuthMethod -eq 'SQL') {
+        if ([string]::IsNullOrWhiteSpace($InputObject.Username)) {
+            return 'Please enter a username for SQL Server Authentication.'
+        }
+
+        if ($ForConnect -and ($null -eq $InputObject.Password -or $InputObject.Password.Length -eq 0)) {
+            return 'Please enter a password for SQL Server Authentication.'
+        }
+    }
+
+    return $null
+}
+
+function Build-TestConnectionString {
+    param(
+        [Parameter(Mandatory)]$InputObject
+    )
+
+    $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $builder['Data Source']        = $InputObject.SqlServer
+    $builder['Initial Catalog']    = 'master'
+    $builder['Connect Timeout']    = 5
+    $builder['Application Name']   = 'SQL Security Assessment - Test Connection'
+
+    switch ($InputObject.EncryptOption) {
+        'Mandatory' { $builder['Encrypt'] = $true }
+        default     { $builder['Encrypt'] = $false }
+    }
+
+    $builder['TrustServerCertificate'] = $InputObject.TrustCert
+
+    if ($InputObject.AuthMethod -eq 'Windows') {
+        $builder['Integrated Security'] = $true
+    }
+
+    $builder.ConnectionString
+}
+
+function Test-SqlConnection {
+    param(
+        [Parameter(Mandatory)]$InputObject
+    )
+
+    $connectionString = Build-TestConnectionString -InputObject $InputObject
+
+    if ($InputObject.AuthMethod -eq 'SQL') {
+        $InputObject.Password.MakeReadOnly()
+        $credential = New-Object System.Data.SqlClient.SqlCredential($InputObject.Username, $InputObject.Password)
+        $connection  = New-Object System.Data.SqlClient.SqlConnection($connectionString, $credential)
+    }
+    else {
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    }
+
+    try {
+        $connection.Open()
+        $command = $connection.CreateCommand()
+        $command.CommandText = @"
+SELECT
+    CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS ProductVersion,
+    CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS ProductLevel,
+    CAST(SERVERPROPERTY('Edition') AS nvarchar(256)) AS Edition
+"@
+        $reader = $command.ExecuteReader()
+        $row = $null
+        if ($reader.Read()) {
+            $row = [pscustomobject]@{
+                ProductVersion = [string]$reader['ProductVersion']
+                ProductLevel   = [string]$reader['ProductLevel']
+                Edition        = [string]$reader['Edition']
+            }
+        }
+        $reader.Close()
+        return $row
+    }
+    finally {
+        if ($connection.State -ne [System.Data.ConnectionState]::Closed) {
+            $connection.Close()
+        }
+        $connection.Dispose()
+    }
+}
+
+
+function Invoke-SqlPermissionCheck {
+    param(
+        [Parameter(Mandatory)]$InputObject
+    )
+
+    $connectionString = Build-TestConnectionString -InputObject $InputObject
+
+    if ($InputObject.AuthMethod -eq 'SQL') {
+        $InputObject.Password.MakeReadOnly()
+        $credential = New-Object System.Data.SqlClient.SqlCredential($InputObject.Username, $InputObject.Password)
+        $connection  = New-Object System.Data.SqlClient.SqlConnection($connectionString, $credential)
+    }
+    else {
+        $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+    }
+
+    try {
+        $connection.Open()
+
+        $metadataCommand = $connection.CreateCommand()
+        $metadataCommand.CommandText = @"
+DECLARE @ProductVersion nvarchar(128) = CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128));
+DECLARE @MajorVersion int = CAST(PARSENAME(@ProductVersion, 4) AS int);
+DECLARE @MinorVersion int = CAST(PARSENAME(@ProductVersion, 3) AS int);
+
+SELECT
+    SUSER_SNAME() AS ExecutionLogin,
+    @ProductVersion AS ProductVersion,
+    @MajorVersion AS MajorVersion,
+    CONVERT(nvarchar(100),
+        CASE
+            WHEN @MajorVersion = 17 THEN 'SQL Server 2025'
+            WHEN @MajorVersion = 16 THEN 'SQL Server 2022'
+            WHEN @MajorVersion = 15 THEN 'SQL Server 2019'
+            WHEN @MajorVersion = 14 THEN 'SQL Server 2017'
+            WHEN @MajorVersion = 13 THEN 'SQL Server 2016'
+            WHEN @MajorVersion = 12 THEN 'SQL Server 2014'
+            WHEN @MajorVersion = 11 THEN 'SQL Server 2012'
+            WHEN @MajorVersion = 10 AND @MinorVersion = 0  THEN 'SQL Server 2008'
+            WHEN @MajorVersion = 10 AND @MinorVersion = 50 THEN 'SQL Server 2008 R2'
+            WHEN @MajorVersion = 9  THEN 'SQL Server 2005'
+            WHEN @MajorVersion = 8  THEN 'SQL Server 2000'
+            ELSE 'Unknown Version'
+        END) AS SqlServerVersion
+"@
+
+        $metadataReader = $metadataCommand.ExecuteReader()
+        $executionLogin = ''
+        $productVersion = ''
+        $sqlServerVersion = ''
+        $majorVersion = 0
+
+        if ($metadataReader.Read()) {
+            if ($metadataReader['ExecutionLogin'] -ne [DBNull]::Value) {
+                $executionLogin = [string]$metadataReader['ExecutionLogin']
+            }
+
+            if ($metadataReader['ProductVersion'] -ne [DBNull]::Value) {
+                $productVersion = [string]$metadataReader['ProductVersion']
+            }
+
+            if ($metadataReader['SqlServerVersion'] -ne [DBNull]::Value) {
+                $sqlServerVersion = [string]$metadataReader['SqlServerVersion']
+            }
+
+            if ($metadataReader['MajorVersion'] -ne [DBNull]::Value) {
+                $majorVersion = [int]$metadataReader['MajorVersion']
+            }
+        }
+
+        $metadataReader.Close()
+
+        if ($majorVersion -ge 12) {
+            if ($InputObject.PSObject.Properties['AwsRdsCompat'] -and [bool]$InputObject.AwsRdsCompat) {
+                $permissionSql = @"
+SELECT
+    v.permission_name AS role_or_permission,
+    CASE HAS_PERMS_BY_NAME(NULL, NULL, v.permission_name)
+        WHEN 1 THEN N'Yes'
+        WHEN 0 THEN N'No'
+        ELSE N'UNKNOWN'
+    END AS check_status
+FROM (VALUES
+    (N'VIEW SERVER SECURITY STATE'),
+    (N'VIEW ANY SECURITY DEFINITION'),
+    (N'VIEW SERVER PERFORMANCE STATE')
+) v(permission_name);
+"@
+            }
+            else {
+                $permissionSql = @"
+SELECT
+    N'securityadmin OR sysadmin' AS role_or_permission,
+    CASE
+        WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1
+          OR IS_SRVROLEMEMBER(N'securityadmin') = 1
+        THEN N'Yes'
+        ELSE N'No'
+    END AS check_status
+
+UNION ALL
+
+SELECT
+    v.permission_name AS role_or_permission,
+    CASE HAS_PERMS_BY_NAME(NULL, NULL, v.permission_name)
+        WHEN 1 THEN N'Yes'
+        WHEN 0 THEN N'No'
+        ELSE N'UNKNOWN'
+    END AS check_status
+FROM (VALUES
+    (N'VIEW SERVER SECURITY STATE'),
+    (N'VIEW ANY SECURITY DEFINITION'),
+    (N'VIEW SERVER PERFORMANCE STATE'),
+    (N'CONNECT ANY DATABASE')
+) v(permission_name);
+"@
+            }
+        }
+        else {
+            $permissionSql = @"
+SELECT
+    N'sysadmin' AS role_or_permission,
+    CASE
+        WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1
+        THEN N'Yes'
+        ELSE N'No'
+    END AS check_status;
+"@
+        }
+
+        $permissionCommand = $connection.CreateCommand()
+        $permissionCommand.CommandText = $permissionSql
+        $permissionReader = $permissionCommand.ExecuteReader()
+
+        $rows = New-Object System.Collections.Generic.List[object]
+
+        while ($permissionReader.Read()) {
+            $roleOrPermission = ''
+            $checkStatus = ''
+
+            if ($permissionReader['role_or_permission'] -ne [DBNull]::Value) {
+                $roleOrPermission = [string]$permissionReader['role_or_permission']
+            }
+
+            if ($permissionReader['check_status'] -ne [DBNull]::Value) {
+                $checkStatus = [string]$permissionReader['check_status']
+            }
+
+            $rows.Add([pscustomobject]@{
+                RoleOrPermission = $roleOrPermission
+                CheckStatus      = $checkStatus
+            }) | Out-Null
+        }
+
+        $permissionReader.Close()
+
+        $insufficientRows = @($rows | Where-Object { $_.CheckStatus -ne 'Yes' })
+
+        return [pscustomobject]@{
+            ExecutionLogin        = $executionLogin
+            SqlServerVersion      = $sqlServerVersion
+            ProductVersion        = $productVersion
+            MajorVersion          = $majorVersion
+            Rows                  = [object[]]$rows.ToArray()
+            InsufficientRows      = [object[]]$insufficientRows
+            HasInsufficientAccess = ($insufficientRows.Count -gt 0)
+        }
+    }
+    finally {
+        if ($connection.State -ne [System.Data.ConnectionState]::Closed) {
+            $connection.Close()
+        }
+
+        $connection.Dispose()
+    }
+}
+
+function Format-SqlPermissionCheckMessage {
+    param(
+        [Parameter(Mandatory)]$PermissionResult
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+
+    $lines.Add(("Connected as: {0}" -f $PermissionResult.ExecutionLogin)) | Out-Null
+    $lines.Add(("SQL Server version: {0}" -f $PermissionResult.SqlServerVersion)) | Out-Null
+    $lines.Add("") | Out-Null
+    $lines.Add("Permission check results:") | Out-Null
+
+    foreach ($row in @($PermissionResult.Rows)) {
+        $lines.Add(("{0}: {1}" -f $row.RoleOrPermission, $row.CheckStatus)) | Out-Null
+    }
+
+    if ($PermissionResult.HasInsufficientAccess) {
+        $lines.Add("") | Out-Null
+        $lines.Add("WARNING: Permissions do not appear sufficient to run the assessment.") | Out-Null
+    }
+    else {
+        $lines.Add("") | Out-Null
+        $lines.Add("Permission check passed.") | Out-Null
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Format-ServerName {
+    param([string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $Name }
+
+    # Strip port suffix (e.g. "Servername,1566" or "Servername\Instance,1566")
+    # The port in SQL Server connection strings is always separated by a comma
+    $Name = ($Name -split ',')[0].TrimEnd()
+
+    $segments = $Name.Split('\')
+    $segments = foreach ($segment in $segments) {
+        if ([string]::IsNullOrEmpty($segment)) { $segment }
+        else { $segment.Substring(0,1).ToUpper() + $segment.Substring(1) }
+    }
+    [string]::Join('\', $segments)
+}
+
+function Get-SqlServiceLoginExclusions {
+    param([string]$SqlInstance)
+
+    $instanceName = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($SqlInstance)) {
+        $target = ([string]$SqlInstance).Trim()
+        $target = $target -replace '^(?i)(tcp|np|lpc):', ''
+        $target = ($target -split ',')[0].TrimEnd()
+
+        $segments = $target.Split('\')
+        if ($segments.Count -gt 1 -and -not [string]::IsNullOrWhiteSpace($segments[1])) {
+            $instanceName = $segments[1].Trim()
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($instanceName)) {
+        return @(
+            'NT SERVICE\MSSQLSERVER'
+            'NT SERVICE\SQLSERVERAGENT'
+        )
+    }
+
+    return @(
+        ('NT SERVICE\MSSQL${0}' -f $instanceName)
+        ('NT SERVICE\SQLAGENT${0}' -f $instanceName)
+    )
+}
+function Get-Check026PermissionExclusions {
+    return @(
+        [pscustomobject]@{ LoginName = 'NT AUTHORITY\SYSTEM'; PermissionName = 'ALTER ANY AVAILABILITY GROUP' },
+        [pscustomobject]@{ LoginName = 'NT AUTHORITY\SYSTEM'; PermissionName = 'VIEW SERVER STATE' },
+        [pscustomobject]@{ LoginName = 'public'; PermissionName = 'VIEW ANY DATABASE' }
+    )
+}
+function Normalize-AwSqlRecText {
+    param([string]$Text)
+
+    if ($null -eq $Text) { return '' }
+
+    $Text = [string]$Text
+
+    # Repair common UTF-8/Windows-1252 mojibake sequences before HTML encoding.
+    # These can appear when smart punctuation is read through the wrong code page.
+    $badEnDash1 = ([string][char]0x00C3) + [char]0x00A2 + [char]0x00E2 + [char]0x201A + [char]0x00AC + [char]0x00E2 + [char]0x20AC + [char]0x0153
+    $badEmDash1 = ([string][char]0x00C3) + [char]0x00A2 + [char]0x00E2 + [char]0x201A + [char]0x00AC + [char]0x00E2 + [char]0x20AC + [char]0x009D
+    $badEnDash2 = ([string][char]0x00E2) + [char]0x20AC + [char]0x201C
+    $badEmDash2 = ([string][char]0x00E2) + [char]0x20AC + [char]0x201D
+    $badRightSingleQuote = ([string][char]0x00E2) + [char]0x20AC + [char]0x2122
+    $badLeftSingleQuote  = ([string][char]0x00E2) + [char]0x20AC + [char]0x02DC
+    $badLeftDoubleQuote  = ([string][char]0x00E2) + [char]0x20AC + [char]0x015C
+    $badRightDoubleQuote = ([string][char]0x00E2) + [char]0x20AC + [char]0x009D
+
+    $Text = $Text.Replace($badEnDash1, '-')
+    $Text = $Text.Replace($badEmDash1, '-')
+    $Text = $Text.Replace($badEnDash2, '-')
+    $Text = $Text.Replace($badEmDash2, '-')
+    $Text = $Text.Replace($badRightSingleQuote, "'")
+    $Text = $Text.Replace($badLeftSingleQuote, "'")
+    $Text = $Text.Replace($badLeftDoubleQuote, '"')
+    $Text = $Text.Replace($badRightDoubleQuote, '"')
+
+    # Normalize smart punctuation to ASCII for Windows PowerShell 5.1 compatibility.
+    $Text = $Text.Replace([string][char]0x2013, '-')   # en dash
+    $Text = $Text.Replace([string][char]0x2014, '-')   # em dash
+    $Text = $Text.Replace([string][char]0x2018, "'")  # left single quotation mark
+    $Text = $Text.Replace([string][char]0x2019, "'")  # right single quotation mark
+    $Text = $Text.Replace([string][char]0x201C, '"')   # left double quotation mark
+    $Text = $Text.Replace([string][char]0x201D, '"')   # right double quotation mark
+    $Text = $Text.Replace([string][char]0x00A0, ' ')   # non-breaking space
+
+    return $Text.Trim()
+}
+function Protect-HeaderValue {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return '' }
+
+    $text = [string]$Value
+
+    if ($text -eq [string]$Username -and -not [string]::IsNullOrWhiteSpace($text)) { return '[redacted]' }
+
+    # Defensive redaction for common key/value accidental leaks
+    $text = $text -replace '(?i)\b(password|pwd)\s*=\s*[^;,\s]+', '$1=[redacted]'
+    $text = $text -replace '(?i)\b(user\s*id|uid|username)\s*=\s*[^;,\s]+', '$1=[redacted]'
+
+    return $text
+}
+
+function Normalize-CheckId {
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value) { return $null }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $number = 0
+    if ([int]::TryParse($text.Trim(), [ref]$number)) {
+        return ('{0:D3}' -f $number)
+    }
+
+    return $text.Trim()
+}
+
+function Get-RowCheckId {
+    param([object]$Row)
+    if ($null -eq $Row) { return $null }
+    if ($Row.PSObject.Properties['Check ID']) { return Normalize-CheckId $Row.'Check ID' }
+    if ($Row.PSObject.Properties['ID']) { return Normalize-CheckId $Row.ID }
+    return $null
+}
+
+function Get-RowCheckName {
+    param([object]$Row)
+    if ($null -eq $Row) { return '' }
+    if ($Row.PSObject.Properties['Check Name']) { return [string]$Row.'Check Name' }
+    if ($Row.PSObject.Properties['Name']) { return [string]$Row.Name }
+    return ''
+}
+
+
+function Resolve-SkipChecks {
+    param(
+        [AllowNull()]
+        [string[]]$RequestedSkipChecks
+    )
+
+    $resolved = New-Object System.Collections.Generic.List[string]
+
+    foreach ($item in @($RequestedSkipChecks)) {
+        if ([string]::IsNullOrWhiteSpace($item)) { continue }
+
+        foreach ($part in ([string]$item -split ',')) {
+            $normalized = Normalize-CheckId $part
+            if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+            if (-not $resolved.Contains($normalized)) {
+                $resolved.Add($normalized) | Out-Null
+            }
+        }
+    }
+
+    return [string[]]$resolved.ToArray()
+}
+
+function Remove-SkippedAssessmentSqlBatches {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SqlText,
+
+        [AllowNull()]
+        [string[]]$SkipCheckIds
+    )
+
+    $normalizedSkipCheckIds = @(Resolve-SkipChecks -RequestedSkipChecks $SkipCheckIds)
+    if ($normalizedSkipCheckIds.Count -eq 0) { return $SqlText }
+
+    $batches = @($SqlText -split '(?im)^\s*GO\s*$')
+    $keptBatches = New-Object System.Collections.Generic.List[string]
+
+    foreach ($batch in $batches) {
+        if ([string]::IsNullOrWhiteSpace($batch)) { continue }
+
+        $batchCheckIds = New-Object System.Collections.Generic.List[string]
+        $matches = [System.Text.RegularExpressions.Regex]::Matches(
+            $batch,
+            "(?i)(?:N)?'(?<CheckId>\d{1,3})'\s+AS\s+\[(?:Check\s*ID|CheckID)\]"
+        )
+
+        foreach ($match in $matches) {
+            $checkId = Normalize-CheckId $match.Groups['CheckId'].Value
+            if ([string]::IsNullOrWhiteSpace($checkId)) { continue }
+            if (-not $batchCheckIds.Contains($checkId)) {
+                $batchCheckIds.Add($checkId) | Out-Null
+            }
+        }
+
+        if ($batchCheckIds.Count -eq 0) {
+            $keptBatches.Add($batch.Trim()) | Out-Null
+            continue
+        }
+
+        $remainingIds = @($batchCheckIds.ToArray() | Where-Object { $_ -notin $normalizedSkipCheckIds })
+        if ($remainingIds.Count -gt 0) {
+            $keptBatches.Add($batch.Trim()) | Out-Null
+        }
+    }
+
+    return ($keptBatches.ToArray() -join "`r`nGO`r`n")
+}
+
+function Get-RowsFromCheckBucket {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RowsByCheckId,
+        [Parameter(Mandatory = $true)]
+        [string]$CheckId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CheckId)) { return @() }
+    if ($null -eq $RowsByCheckId) { return @() }
+    if (-not $RowsByCheckId.ContainsKey($CheckId)) { return @() }
+
+    $bucket = $RowsByCheckId[$CheckId]
+    if ($null -eq $bucket) { return @() }
+
+    if ($bucket -is [System.Collections.IEnumerable] -and
+        $bucket -isnot [string] -and
+        $bucket -isnot [System.Management.Automation.PSCustomObject]) {
+
+        $list = New-Object System.Collections.Generic.List[object]
+
+        foreach ($item in $bucket) {
+            if ($null -ne $item) {
+                $list.Add($item) | Out-Null
+            }
+        }
+
+        return [object[]]$list.ToArray()
+    }
+
+    return @($bucket)
+}
+
+function Test-IsInformationalOnlyCheck {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CheckId
+    )
+
+    $number = 0
+    if ([int]::TryParse($CheckId, [ref]$number)) {
+        return ($number -ge 800 -and $number -lt 900)
+    }
+
+    return $false
+}
+
+function Get-ExecutiveData {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Items
+    )
+
+    return @($Items | Where-Object { -not (Test-IsInformationalOnlyCheck -CheckId ([string]$_.CheckId)) })
+}function Get-NumericValueFromColumn {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows,
+        [Parameter(Mandatory = $true)]
+        [string]$ColumnName
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) { return $null }
+    if ([string]::IsNullOrWhiteSpace($ColumnName)) { return $null }
+
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+        if (-not $row.PSObject.Properties[$ColumnName]) { continue }
+
+        $raw = $row.$ColumnName
+        if ($null -eq $raw) { continue }
+
+        $num = 0.0
+        if ([double]::TryParse([string]$raw, [System.Globalization.NumberStyles]::Any, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$num)) {
+            return $num
+        }
+        if ([double]::TryParse([string]$raw, [ref]$num)) {
+            return $num
+        }
+    }
+
+    return $null
+}
+
+function Get-FirstNumericValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows
+    )
+
+    $excludeFirstNumericColumns = @('Check ID', 'ID', 'Check Name', 'Name')
+    foreach ($row in $Rows) {
+        $props = @($row.PSObject.Properties | Where-Object { $_.Name -notin $excludeFirstNumericColumns })
+        foreach ($prop in $props) {
+            if ($null -eq $prop.Value) { continue }
+
+            $parsed = 0.0
+            $text = [string]$prop.Value
+            if ([double]::TryParse($text, [ref]$parsed)) {
+                return $parsed
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-SqlDefinedChecks {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SqlText
+    )
+
+    $results = @()
+    $seen = @{}
+    $order = 0
+
+    $commentPattern = "(?im)^\s*--\s*Check\s*:\s*(?<CheckId>\d{1,3})\s+(?<CheckName>.+?)\.sql\s*$"
+    $commentMatches = [System.Text.RegularExpressions.Regex]::Matches($SqlText, $commentPattern)
+
+    foreach ($match in $commentMatches) {
+        $order++
+        $checkId = Normalize-CheckId $match.Groups['CheckId'].Value
+        if ($null -eq $checkId) { continue }
+        if ($seen.ContainsKey($checkId)) { continue }
+
+        $checkName = [string]$match.Groups['CheckName'].Value
+        $seen[$checkId] = $true
+
+        $results += [PSCustomObject]@{
+            CheckId   = $checkId
+            CheckName = $checkName.Trim()
+            SqlOrder  = $order
+        }
+    }
+
+    if ($results.Count -gt 0) {
+        return @($results)
+    }
+
+    $selectPattern = "(?is)(?:N)?'(?<CheckId>\d{1,3})'\s+AS\s+\[(?:Check\s*ID|CheckID)\]\s*,\s*(?:N)?'(?<CheckName>(?:''|[^'])*)'\s+AS\s+\[(?:Check\s*Name|CheckName)\]"
+    $selectMatches = [System.Text.RegularExpressions.Regex]::Matches($SqlText, $selectPattern)
+
+    foreach ($match in $selectMatches) {
+        $order++
+        $checkId = Normalize-CheckId $match.Groups['CheckId'].Value
+        if ($null -eq $checkId) { continue }
+        if ($seen.ContainsKey($checkId)) { continue }
+
+        $checkName = $match.Groups['CheckName'].Value -replace "''", "'"
+        $seen[$checkId] = $true
+
+        $results += [PSCustomObject]@{
+            CheckId   = $checkId
+            CheckName = [string]$checkName
+            SqlOrder  = $order
+        }
+    }
+
+    return @($results)
+}
+
+function Get-OutcomeBadgeHtml {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Outcome
+    )
+
+    return "<span class='badge outcome-$Outcome'>$Outcome</span>"
+}
+
+function Get-ChecksProgressHtml {
+    param(
+        [int]$Passed,
+        [int]$Total
+    )
+
+    $percent = 0
+    if ($Total -gt 0) {
+        $percent = [math]::Round(($Passed / $Total) * 100)
+    }
+
+    return @"
+<div class='checks-progress' title='$Passed of $Total checks passed'>
+    <div class='checks-progress-track'>
+        <div class='checks-progress-fill' style='width: $($percent)%;'></div>
+    </div>
+    <div class='checks-progress-text'>$Passed / $Total</div>
+</div>
+"@
+}
+
+function Convert-DataRowsToHtmlTable {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows
+    )
+
+    if (-not $Rows -or $Rows.Count -eq 0) {
+        return "<div class='empty-detail'>No detail rows returned for this check.</div>"
+    }
+
+    $excludeColumns = @(
+        'Check ID', 'Check Name', 'ID', 'RowError', 'RowState', 'Table', 'ItemArray', 'HasErrors'
+    )
+
+    $detailColumnNames = @(
+        $Rows[0].PSObject.Properties |
+        Where-Object { $_.Name -notin $excludeColumns } |
+        Select-Object -ExpandProperty Name
+    )
+
+    if ($detailColumnNames.Count -eq 0) {
+        return "<div class='empty-detail'>No detail columns returned.</div>"
+    }
+
+    function Test-IsEmptyAdditionalInfoValue {
+        param([AllowNull()][object]$Value)
+
+        if ($null -eq $Value) { return $true }
+
+        $text = ([string]$Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { return $true }
+
+        $normalized = $text.ToLowerInvariant()
+        if ($normalized -in @(
+            '{}',
+            '<additionalinfo />',
+            '<additionalinfo/>',
+            '&lt;additionalinfo /&gt;',
+            '&lt;additionalinfo/&gt;'
+        )) { return $true }
+
+        return $false
+    }
+
+    $headerCells = foreach ($columnName in $detailColumnNames) {
+        $safeName = [System.Net.WebUtility]::HtmlEncode([string]$columnName)
+        "<th>$safeName</th>"
+    }
+
+    $bodyRows = foreach ($row in $Rows) {
+        $cells = foreach ($columnName in $detailColumnNames) {
+            $value = $row.$columnName
+
+            if ([string]$columnName -eq 'AdditionalInfo') {
+                if (Test-IsEmptyAdditionalInfoValue $value) {
+                    "<td class='additional-info-cell'></td>"
+                    continue
+                }
+
+                $safeXml = [System.Net.WebUtility]::HtmlEncode([string]$value)
+                "<td class='additional-info-cell'><details class='xml-expand'><summary>Show XML</summary><div class='xml-content'>$safeXml</div></details></td>"
+                continue
+            }
+
+            if ($null -eq $value) {
+                $textValue = ''
+            }
+            elseif ($value -is [byte[]]) {
+                $bytes = $value
+                while ($bytes.Length -gt 0 -and $bytes[-1] -eq 0) {
+                    $bytes = $bytes[0..($bytes.Length - 2)]
+                }
+
+                if ($bytes.Length -eq 0) {
+                    $textValue = ''
+                }
+                else {
+                    $textValue = '0x' + (($bytes | ForEach-Object { $_.ToString('X2') }) -join '')
+                }
+            }
+            else {
+                $textValue = [string]$value
+            }
+
+            $safeValue = [System.Net.WebUtility]::HtmlEncode($textValue)
+            "<td>$safeValue</td>"
+        }
+
+        "<tr>$($cells -join '')</tr>"
+    }
+
+    return @"
+<table class='detail-table'>
+    <thead>
+        <tr>
+            $($headerCells -join '')
+        </tr>
+    </thead>
+    <tbody>
+        $($bodyRows -join "`r`n")
+    </tbody>
+</table>
+"@
+}
+
+function Get-AwSqlRecommendationCellHtml {
+    param(
+        [string]$Outcome,
+        [string]$CheckId,
+        [hashtable]$RecommendationLookup
+    )
+
+    if ($Outcome -eq 'PASS' -or $Outcome -eq 'INFO') {
+        return "<span class='recommendation-muted'>&mdash;</span>"
+    }
+
+    if ($RecommendationLookup.ContainsKey($CheckId)) {
+        $text = Normalize-AwSqlRecText ([string]$RecommendationLookup[$CheckId].Recommendation)
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $safeText = [System.Net.WebUtility]::HtmlEncode($text) -replace "(`r`n|`r|`n)", "<br />"
+            return "<div class='recommendation-main'>$safeText</div>"
+        }
+    }
+
+    return "<div class='recommendation-main recommendation-missing'>MISSING</div>"
+}function Get-RecommendationPanelHtml {
+    param(
+        [string]$Outcome,
+        [string]$CheckId,
+        [hashtable]$RecommendationLookup,
+        [int]$DetailRowCount = 0
+    )
+
+    if ($Outcome -eq 'PASS') {
+        return ""
+    }
+
+    if ($Outcome -eq 'INFO' -and (Test-IsInformationalOnlyCheck -CheckId $CheckId)) {
+        $isInfoRecommendationException = (
+            $CheckId -eq '800' -or
+            $DetailRowCount -gt 0
+        )
+
+        if (-not $isInfoRecommendationException) {
+            return ""
+        }
+    }
+
+    $text = 'MISSING'
+    $referenceTitle = ''
+    $referenceUrl = ''
+    $referenceTitle2 = ''
+    $referenceUrl2 = ''
+
+    if ($RecommendationLookup.ContainsKey($CheckId)) {
+        $candidateText = Normalize-AwSqlRecText ([string]$RecommendationLookup[$CheckId].Recommendation)
+        if (-not [string]::IsNullOrWhiteSpace($candidateText)) {
+            $text = $candidateText
+        }
+        $referenceTitle = Normalize-AwSqlRecText ([string]$RecommendationLookup[$CheckId].ReferenceTitle)
+        $referenceUrl = [string]$RecommendationLookup[$CheckId].ReferenceUrl
+        $referenceTitle2 = Normalize-AwSqlRecText ([string]$RecommendationLookup[$CheckId].ReferenceTitle2)
+        $referenceUrl2 = [string]$RecommendationLookup[$CheckId].ReferenceUrl2
+    }
+
+    $safeText = [System.Net.WebUtility]::HtmlEncode($text) -replace "(`r`n|`r|`n)", "<br />"
+    
+    $referenceHtmlBlocks = New-Object System.Collections.Generic.List[string]
+
+    if (-not [string]::IsNullOrWhiteSpace($referenceUrl)) {
+        $safeUrl = [System.Net.WebUtility]::HtmlEncode($referenceUrl)
+        if (-not [string]::IsNullOrWhiteSpace($referenceTitle)) {
+            if ($referenceTitle -match '^\s*ReferenceTitle\s*=\s*(.+)$') { $referenceTitle = $matches[1].Trim() }
+            $safeLinkText = [System.Net.WebUtility]::HtmlEncode($referenceTitle)
+        }
+        else {
+            $safeLinkText = $safeUrl
+        }
+
+        $referenceHtmlBlocks.Add("<div class='recommendation-reference'><strong>Reference:</strong> <a href='$safeUrl' target='_blank' rel='noopener noreferrer'>$safeLinkText</a></div>") | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($referenceUrl2)) {
+        $safeUrl2 = [System.Net.WebUtility]::HtmlEncode($referenceUrl2)
+        if (-not [string]::IsNullOrWhiteSpace($referenceTitle2)) {
+            if ($referenceTitle2 -match '^\s*ReferenceTitle2\s*=\s*(.+)$') { $referenceTitle2 = $matches[1].Trim() }
+            $safeLinkText2 = [System.Net.WebUtility]::HtmlEncode($referenceTitle2)
+        }
+        else {
+            $safeLinkText2 = $safeUrl2
+        }
+
+        $referenceHtmlBlocks.Add("<div class='recommendation-reference'><strong>Reference:</strong> <a href='$safeUrl2' target='_blank' rel='noopener noreferrer'>$safeLinkText2</a></div>") | Out-Null
+    }
+
+    $referencesHtml = $referenceHtmlBlocks -join "`r`n"
+
+    return @"
+<div class='recommendation-panel outcome-$Outcome'>
+    <div class='recommendation-title'>Recommendation</div>
+    <div class='recommendation-body'>$safeText</div>
+    $referencesHtml
+</div>
+"@
+}function Get-ChartHtml {
+    param(
+        [int]$Passes,
+        [int]$Observes,
+        [int]$Warns,
+        [int]$Fails,
+        [int]$InfoCount,
+        [int]$ActionableTotal,
+        [int]$OverallTotal)
+
+    $outcomeTotal = [Math]::Max(1, ($Passes + $Observes + $Warns + $Fails))
+    $passPct = [Math]::Round(($Passes / $outcomeTotal) * 100, 0)
+    $observePct = [Math]::Round(($Observes / $outcomeTotal) * 100, 0)
+    $warningPct = [Math]::Round(($Warns / $outcomeTotal) * 100, 0)
+    $failPct = [Math]::Max(0, 100 - $passPct - $observePct - $warningPct)
+
+    $mainChartHtml = @"
+<div class='chart-card chart-card-primary'>
+    <div class='chart-title'>Outcome Distribution</div>
+    <div class='distribution-bar' aria-label='Outcome Distribution'>
+        <div class='distribution-segment distribution-pass' style='width: $($passPct)%;'></div>
+        <div class='distribution-segment distribution-observe' style='width: $($observePct)%;'></div>
+        <div class='distribution-segment distribution-warning' style='width: $($warningPct)%;'></div>
+        <div class='distribution-segment distribution-fail' style='width: $($failPct)%;'></div>
+    </div>
+    <div class='chart-legend'>
+        <div><span class='legend-swatch distribution-pass'></span>Pass: $Passes ($($passPct)%)</div>
+        <div><span class='legend-swatch distribution-observe'></span>Observe: $Observes ($($observePct)%)</div>
+        <div><span class='legend-swatch distribution-warning'></span>Warning: $Warns ($($warningPct)%)</div>
+        <div><span class='legend-swatch distribution-fail'></span>Fail: $Fails ($($failPct)%)</div>
+    </div>
+</div>
+"@
+
+    return $mainChartHtml
+}
+
+function Get-CheckOutcome {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CheckId,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$RecommendationLookup
+    )
+
+    if (Test-IsInformationalOnlyCheck -CheckId $CheckId) { return 'INFO' }
+
+    if (-not $Rules.Contains($CheckId)) {
+        return 'INFO'
+    }
+
+    $rule = $Rules[$CheckId]
+    $method = [string]$rule.Method
+    $configuredSeverity = 'FAIL'
+
+    if ($rule.ContainsKey('Severity') -and -not [string]::IsNullOrWhiteSpace([string]$rule.Severity)) {
+        $configuredSeverity = ([string]$rule.Severity).ToUpperInvariant()
+    }
+
+    switch ($method) {
+        'static' {
+            return $configuredSeverity
+        }
+
+        'rows_exist' {
+            if ($Rows.Count -gt 0) { return $configuredSeverity }
+            return 'PASS'
+        }
+
+        'threshold_max' {
+            $value = Get-NumericValueFromColumn -Rows $Rows -ColumnName ([string]$rule.Column)
+            $limit = $null
+            if ($rule.ContainsKey('Limit')) { $limit = [double]$rule.Limit }
+            elseif ($rule.ContainsKey('Value')) { $limit = [double]$rule.Value }
+
+            if ($null -ne $value -and $null -ne $limit -and $value -gt $limit) {
+                return $configuredSeverity
+            }
+            return 'PASS'
+        }
+
+        'threshold_max_stacked' {
+            $value = Get-NumericValueFromColumn -Rows $Rows -ColumnName ([string]$rule.Column)
+            if ($null -eq $value) { return 'PASS' }
+
+            $result = 'PASS'
+
+            foreach ($threshold in @($rule.Thresholds)) {
+                if ($threshold.ContainsKey('GreaterThan') -and $value -gt [double]$threshold.GreaterThan) {
+                    $result = ([string]$threshold.Severity).ToUpperInvariant()
+                }
+                elseif ($threshold.ContainsKey('GreaterThanOrEqual') -and $value -ge [double]$threshold.GreaterThanOrEqual) {
+                    $result = ([string]$threshold.Severity).ToUpperInvariant()
+                }
+            }
+
+            return $result
+        }
+
+        'threshold_min' {
+            $value = Get-NumericValueFromColumn -Rows $Rows -ColumnName ([string]$rule.Column)
+            $limit = $null
+            if ($rule.ContainsKey('Limit')) { $limit = [double]$rule.Limit }
+            elseif ($rule.ContainsKey('Value')) { $limit = [double]$rule.Value }
+
+            if ($null -eq $value) { return $configuredSeverity }
+            if ($null -ne $limit -and $value -lt $limit) { return $configuredSeverity }
+            return 'PASS'
+        }
+
+        'column_equals' {
+            $columnName = [string]$rule.Column
+            $expectedValue = [string]$rule.ExpectedValue
+
+            foreach ($row in $Rows) {
+                if ($row.PSObject.Properties.Name -contains $columnName) {
+                    $actualValue = [string]$row.$columnName
+                    if ($actualValue -eq $expectedValue) {
+                        return $configuredSeverity
+                    }
+                }
+            }
+
+            return 'PASS'
+        }
+
+        'row_count_equals' {
+            $expectedCount = 0
+            if ($rule.ContainsKey('Count')) {
+                $expectedCount = [int]$rule.Count
+            }
+
+            if ($Rows.Count -eq $expectedCount) {
+                return $configuredSeverity
+            }
+            return 'PASS'
+        }
+
+        'threshold_band_min' {
+            $value = Get-FirstNumericValue -Rows $Rows
+            if ($null -eq $value) { return 'PASS' }
+
+            $bands = @($rule.Bands | Sort-Object { [double]$_.Limit })
+            foreach ($band in $bands) {
+                $limit = [double]$band.Limit
+                if ($value -lt $limit) {
+                    return ([string]$band.Severity).ToUpperInvariant()
+                }
+            }
+
+            return 'PASS'
+        }
+
+        default {
+            return 'INFO'
+        }
+    }
+}
+
+
+function Get-SqlServerMajorVersionFromRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows
+    )
+
+    $versionNumber = ''
+
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+        if ((Get-RowCheckId $row) -ne '800') { continue }
+        if (-not $row.PSObject.Properties['Item']) { continue }
+        if (-not $row.PSObject.Properties['Value']) { continue }
+
+        $itemName = ([string]$row.Item).Trim()
+        $itemValue = ([string]$row.Value).Trim()
+
+        if ($itemName -eq 'Product Major Version') {
+            $majorVersion = 0
+            if ([int]::TryParse($itemValue, [ref]$majorVersion)) {
+                return $majorVersion
+            }
+        }
+
+        if ($itemName -eq 'Version Number') {
+            $versionNumber = $itemValue
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($versionNumber)) {
+        $majorVersionText = ($versionNumber -split '\.')[0]
+        $majorVersion = 0
+        if ([int]::TryParse($majorVersionText, [ref]$majorVersion)) {
+            return $majorVersion
+        }
+    }
+
+    return $null
+}
+
+function Test-AwsRdsInstanceFromRows {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Rows
+    )
+
+    foreach ($row in $Rows) {
+        if ($null -eq $row) { continue }
+        if ((Get-RowCheckId $row) -ne '800') { continue }
+        if (-not $row.PSObject.Properties['Item']) { continue }
+        if (-not $row.PSObject.Properties['Value']) { continue }
+
+        $itemName = ([string]$row.Item).Trim()
+        $itemValue = ([string]$row.Value).Trim()
+
+        if ($itemName -eq 'AWS RDS detected') {
+            return ($itemValue -eq 'Yes')
+        }
+    }
+
+    return $false
+}
+
+function Get-CheckApplicability {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CheckId,
+
+        [AllowNull()]
+        [Nullable[int]]$SqlServerMajorVersion
+    )
+
+    if (-not $Rules.Contains($CheckId)) {
+        return [pscustomobject]@{
+            IsApplicable = $true
+            Message      = ''
+        }
+    }
+
+    $rule = $Rules[$CheckId]
+
+    if ($rule.ContainsKey('MinMajorVersion')) {
+        $minMajorVersion = [int]$rule.MinMajorVersion
+        $detectedMajorVersion = $null
+
+        if ($null -ne $SqlServerMajorVersion -and -not [string]::IsNullOrWhiteSpace([string]$SqlServerMajorVersion)) {
+            $candidateMajorVersion = 0
+            if ([int]::TryParse([string]$SqlServerMajorVersion, [ref]$candidateMajorVersion)) {
+                $detectedMajorVersion = $candidateMajorVersion
+            }
+        }
+
+        if ($null -ne $detectedMajorVersion -and $detectedMajorVersion -lt $minMajorVersion) {
+            return [pscustomobject]@{
+                IsApplicable = $false
+                Message      = ('Not applicable. Requires SQL Server major version {0} or later. Detected major version: {1}.' -f $minMajorVersion, $detectedMajorVersion)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        IsApplicable = $true
+        Message      = ''
+    }
+}
+
+
+function Get-ActionableChecks {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$Items
+    )
+
+    return @($Items | Where-Object { $_.Outcome -ne 'INFO' })
+}function Invoke-AssessmentSqlClient {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServerInstance,
+        [Parameter(Mandatory = $true)]
+        [string]$Database,
+        [Parameter(Mandatory = $true)]
+        [string]$SqlText,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Windows','SQL')]
+        [string]$AuthMethod,
+        [string]$Username,
+        [System.Security.SecureString]$Password,
+        [ValidateSet('Optional','Mandatory')]
+        [string]$EncryptOption = 'Optional',
+        [bool]$TrustCert = $false
+    )
+
+    # Build connection string via SqlConnectionStringBuilder
+    $builder = New-Object System.Data.SqlClient.SqlConnectionStringBuilder
+    $builder['Data Source']         = $ServerInstance
+    $builder['Initial Catalog']     = $Database
+    $builder['Application Name']    = 'SQL Server Security Assessment - Community Edition'
+    $builder['Connect Timeout']     = 30
+
+    switch ($EncryptOption) {
+        'Mandatory' { $builder['Encrypt'] = $true }
+        default     { $builder['Encrypt'] = $false }
+    }
+    $builder['TrustServerCertificate'] = $TrustCert
+
+    if ($AuthMethod -eq 'Windows') {
+        $builder['Integrated Security'] = $true
+        $credential = $null
+    }
+    else {
+        # SqlCredential requires the SecureString to be read-only
+        $Password.MakeReadOnly()
+        $credential = New-Object System.Data.SqlClient.SqlCredential($Username, $Password)
+    }
+
+    # Split SQL text on GO batch separators (case-insensitive, whole line)
+    $batches  = $SqlText -split '(?im)^\s*GO\s*$' |
+                    Where-Object { $_.Trim() -ne '' }
+
+    $connection = $null
+    $results    = [System.Collections.Generic.List[pscustomobject]]::new()
+
+    try {
+        if ($credential) {
+            $connection = New-Object System.Data.SqlClient.SqlConnection($builder.ConnectionString, $credential)
+        }
+        else {
+            $connection = New-Object System.Data.SqlClient.SqlConnection($builder.ConnectionString)
+        }
+
+        $connection.Open()
+
+        foreach ($batch in $batches) {
+            $command                = $connection.CreateCommand()
+            $command.CommandText    = $batch
+            $command.CommandTimeout = 120
+
+            $reader = $command.ExecuteReader()
+            try {
+                do {
+                    # Only process result sets that return rows (SELECT statements)
+                    if ($reader.FieldCount -gt 0 -and $reader.HasRows) {
+                        $columnNames = @(0..($reader.FieldCount - 1) | ForEach-Object { $reader.GetName($_) })
+
+                        while ($reader.Read()) {
+                            $row = [ordered]@{}
+                            foreach ($col in $columnNames) {
+                                $val = $reader[$col]
+                                $row[$col] = if ($val -is [System.DBNull]) { $null } else { $val }
+                            }
+                            $results.Add([pscustomobject]$row)
+                        }
+                    }
+                } while ($reader.NextResult())
+            }
+            finally {
+                $reader.Close()
+            }
+        }
+    }
+    finally {
+        if ($null -ne $connection) { $connection.Close() }
+    }
+
+    return $results
+}
+
+
+
+function Get-Sha256HashFromAwsql {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hashBytes = $sha.ComputeHash($bytes)
+        return (($hashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+Add-Type -AssemblyName System.Data
+
+# --- EMBEDDED SQL ASSESSMENT SCRIPT ---
+$EmbeddedAssessmentSql = @'
+/******************************************************************************
+* SQL Server Security Assessment - Community Edition
+* Logic & Engine by Andreas Wolter (MCSM)
+* Version:    2026.4
+* Scope:      High-Level Security Indicators
+* License:    Sarpedon Community License (See LICENSE.md)
+* Resources:  https://www.SarpedonQualityLab.US/resources
+* * DESCRIPTION:
+* This script collects metadata and executes core security checks to identify 
+* high-level indicators of risk. It is a foundational baseline designed for 
+* community and internal organizational use.
+*
+* DISCLAIMER:
+* This tool is provided "as is" for informational purposes only. It identifies 
+* high-level indicators of risk and does not constitute a comprehensive security 
+* audit, legal advice, or a guarantee of security. The author and Sarpedon 
+* Quality Lab LLC assume no liability for any inaccuracies, system impacts, 
+* or security incidents occurring after its use. Use at your own risk.
+* 
+* --- DO NOT EDIT !
+* --- The Assessment will be blocked if the file has been manipulated !
+* ---
+******************************************************************************/
+
+
+
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET NOCOUNT ON;
+
+
+SELECT
+    '002' AS [Check ID],
+    CASE SERVERPROPERTY('IsIntegratedSecurityOnly')
+        WHEN 1 THEN 'Windows Authentication'
+        WHEN 0 THEN 'Windows and SQL Server Authentication (Mixed Mode)'
+        ELSE 'Unknown'
+    END AS AuthenticationMode,
+	SERVERPROPERTY('IsIntegratedSecurityOnly') AS IsIntegratedSecurityOnly,
+    (
+        SELECT SERVERPROPERTY('IsExternalAuthenticationOnly') AS IsExternalAuthenticationOnly
+		, SERVERPROPERTY('IsExternalGovernanceEnabled') AS IsExternalGovernanceEnabled
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+;
+GO
+
+WITH Connections AS
+(
+    SELECT *
+    FROM sys.dm_exec_connections
+    WHERE protocol_type <> 'Database Mirroring'
+      AND net_transport <> 'Shared memory'
+)
+SELECT
+    '003' AS [Check ID],
+    SUM(CASE WHEN auth_scheme = 'SQL' THEN 1 ELSE 0 END) AS SqlAuthenticationSessionCount,
+    CAST(
+        100.0 * SUM(CASE WHEN auth_scheme = 'SQL' THEN 1 ELSE 0 END)
+        / NULLIF(COUNT(*), 0)
+        AS DECIMAL(5,2)
+    ) AS SqlAuthenticationSessionPercent
+FROM Connections;
+
+GO
+
+WITH Connections AS
+(
+    SELECT *
+    FROM sys.dm_exec_connections
+    WHERE protocol_type <> 'Database Mirroring'
+      AND net_transport <> 'Shared memory'
+)
+SELECT
+    '004' AS [Check ID],
+    SUM(CASE WHEN auth_scheme = 'NTLM' THEN 1 ELSE 0 END) AS NtlmAuthenticationSessionCount,
+    CAST(
+        100.0 * SUM(CASE WHEN auth_scheme = 'NTLM' THEN 1 ELSE 0 END)
+        / NULLIF(COUNT(*), 0)
+        AS DECIMAL(5,2)
+    ) AS NtlmAuthenticationSessionPercent
+FROM Connections;
+
+GO
+
+SELECT
+    '006' AS [Check ID],
+    name AS LoginName,
+    (
+        SELECT
+            is_disabled AS IsDisabled,
+            create_date AS CreateDate,
+            modify_date AS ModifyDate,
+            default_database_name AS DefaultDatabaseName,
+            is_policy_checked AS CheckPolicyEnabled,
+            is_expiration_checked AS CheckExpirationEnabled
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.sql_logins
+WHERE is_policy_checked = 0
+ORDER BY name;
+
+GO
+
+SELECT
+    '008' AS [Check ID],
+    name AS LoginName,
+    modify_date AS ModifyDate
+FROM sys.server_principals
+WHERE sid = 0x01;
+
+GO
+
+SELECT
+    '010' AS [Check ID],
+    server_principals.type_desc AS PrincipalType,
+    name AS LoginName,
+    (
+        SELECT
+            is_disabled,
+            create_date
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.server_role_members AS server_role_members
+JOIN sys.server_principals AS server_principals
+    ON server_role_members.member_principal_id = server_principals.principal_id
+WHERE server_role_members.role_principal_id = SUSER_ID('sysadmin')
+  AND server_principals.name <> SUSER_SNAME(0x01)
+  AND server_principals.name NOT IN ('NT SERVICE\SQLWriter', 'NT SERVICE\Winmgmt')
+  AND server_principals.type NOT IN ('G', 'C', 'K', 'X')
+ORDER BY server_principals.type_desc;
+
+GO
+
+SELECT
+    '011' AS [Check ID],
+    serverrole.name AS ServerRoleName,
+    rolemember.name AS MemberName,
+    (
+        SELECT
+            rolemember.type_desc AS MemberType,
+            rolemember.create_date,
+            rolemember.modify_date,
+            rolemember.is_disabled
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.server_role_members AS rm
+INNER JOIN sys.server_principals AS serverrole
+    ON rm.role_principal_id = serverrole.principal_id
+INNER JOIN sys.server_principals AS rolemember
+    ON rm.member_principal_id = rolemember.principal_id
+WHERE serverrole.name IN (
+        N'securityadmin',
+        N'##MS_DatabaseManager##',
+        N'##MS_LoginManager##'
+)
+ORDER BY serverrole.name, rolemember.name;
+
+
+GO
+
+SELECT
+    '015' AS [Check ID],
+    serverrole.name AS ServerRoleName,
+    rolemember.name AS MemberName,
+    (
+        SELECT
+            rolemember.type_desc AS MemberType,
+            rolemember.create_date,
+            rolemember.modify_date,
+            rolemember.is_disabled
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.server_role_members AS rm
+INNER JOIN sys.server_principals AS serverrole
+    ON rm.role_principal_id = serverrole.principal_id
+INNER JOIN sys.server_principals AS rolemember
+    ON rm.member_principal_id = rolemember.principal_id
+WHERE serverrole.name IN (
+        N'serveradmin',
+        N'securityadmin',
+        N'processadmin',
+        N'setupadmin',
+        N'bulkadmin',
+        N'diskadmin',
+        N'dbcreator',
+        N'##MS_DatabaseManager##',
+        N'##MS_LoginManager##',
+        N'##MS_SecurityDefinitionReader##',
+        N'##MS_ServerSecurityStateReader##'
+)
+ORDER BY serverrole.name, rolemember.name;
+
+
+GO
+
+DECLARE @ProductVersion NVARCHAR(20) = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(20));
+DECLARE @MajorVersion INT = CAST(PARSENAME(@ProductVersion, 4) AS INT);
+
+IF OBJECT_ID('tempdb..#SqlSafeServiceAccounts') IS NOT NULL
+BEGIN
+    DROP TABLE #SqlSafeServiceAccounts;
+END;
+
+BEGIN TRY
+
+    CREATE TABLE #SqlSafeServiceAccounts
+    (
+        service_account NVARCHAR(256) NOT NULL
+    );
+
+    IF @MajorVersion >= 11
+    BEGIN
+        BEGIN TRY
+            EXEC sys.sp_executesql N'
+                INSERT INTO #SqlSafeServiceAccounts (service_account)
+                SELECT DISTINCT service_account
+                FROM sys.dm_server_services
+                WHERE service_account IS NOT NULL;
+            ';
+        END TRY
+        BEGIN CATCH
+            -- If sys.dm_server_services cannot be read, continue with an empty
+            -- service-account exclusion table. This keeps the assessment running.
+        END CATCH;
+    END;
+
+    SELECT
+        '026' AS [Check ID],
+        server_principals.name AS LoginName,
+        server_permissions.permission_name AS PermissionName,
+        (
+            SELECT
+                server_principals.is_disabled,
+                server_principals.type_desc AS LoginType,
+                server_permissions.state_desc,
+                grantor.name AS grantor_name,
+                server_permissions.class_desc,
+                server_permissions.major_id
+            FOR XML PATH('AdditionalInfo'), TYPE
+        ) AS AdditionalInfo
+    FROM sys.server_permissions AS server_permissions
+    INNER JOIN sys.server_principals AS server_principals
+        ON server_permissions.grantee_principal_id = server_principals.principal_id
+    INNER JOIN sys.server_principals AS grantor
+        ON server_permissions.grantor_principal_id = grantor.principal_id
+    LEFT JOIN #SqlSafeServiceAccounts AS service_accounts
+        ON service_accounts.service_account = server_principals.name
+    WHERE
+        NOT (
+            server_permissions.class_desc = 'ENDPOINT'
+            AND server_permissions.major_id = 5
+            AND server_permissions.permission_name = 'CONNECT'
+        )
+        AND service_accounts.service_account IS NULL
+        AND server_principals.is_disabled = 0
+        AND NOT (
+            (server_permissions.state = 'G' AND server_permissions.permission_name = N'CONNECT SQL')
+            OR (server_principals.name = N'public' AND server_permissions.permission_name = N'CONNECT')
+
+            OR (server_principals.name = N'##MS_PolicySigningCertificate##' AND server_permissions.permission_name = N'CONTROL SERVER')
+            OR (server_principals.name = N'##MS_PolicySigningCertificate##' AND server_permissions.permission_name = N'VIEW ANY DEFINITION')
+            OR (server_principals.name = N'##MS_PolicyTsqlExecutionLogin##' AND server_permissions.permission_name = N'VIEW ANY DEFINITION')
+            OR (server_principals.name = N'##MS_PolicyTsqlExecutionLogin##' AND server_permissions.permission_name = N'VIEW SERVER STATE')
+            OR (server_principals.name = N'##MS_SmoExtendedSigningCertificate##' AND server_permissions.permission_name = N'VIEW ANY DEFINITION')
+            OR (server_principals.name = N'##MS_SQLAuthenticatorCertificate##' AND server_permissions.permission_name = N'AUTHENTICATE SERVER')
+            OR (server_principals.name = N'##MS_SQLReplicationSigningCertificate##' AND server_permissions.permission_name = N'AUTHENTICATE SERVER')
+            OR (server_principals.name = N'##MS_SQLReplicationSigningCertificate##' AND server_permissions.permission_name = N'VIEW ANY DEFINITION')
+            OR (server_principals.name = N'##MS_SQLReplicationSigningCertificate##' AND server_permissions.permission_name = N'VIEW SERVER STATE')
+            OR (server_principals.name = N'##MS_SQLResourceSigningCertificate##' AND server_permissions.permission_name = N'VIEW ANY DEFINITION')
+        )
+    ORDER BY server_principals.name, server_permissions.permission_name;
+
+    IF OBJECT_ID('tempdb..#SqlSafeServiceAccounts') IS NOT NULL
+    BEGIN
+        DROP TABLE #SqlSafeServiceAccounts;
+    END;
+
+END TRY
+BEGIN CATCH
+
+    IF OBJECT_ID('tempdb..#SqlSafeServiceAccounts') IS NOT NULL
+    BEGIN
+        DROP TABLE #SqlSafeServiceAccounts;
+    END;
+
+    DECLARE @ErrorMessage NVARCHAR(4000) = ERROR_MESSAGE();
+    DECLARE @ErrorSeverity INT = ERROR_SEVERITY();
+    DECLARE @ErrorState INT = ERROR_STATE();
+
+    RAISERROR(@ErrorMessage, @ErrorSeverity, @ErrorState);
+
+END CATCH;
+
+
+GO
+
+SELECT
+    '027' AS [Check ID],
+    name AS ServerRoleName,
+    principal_id AS PrincipalId,
+    (
+        SELECT
+            create_date,
+            modify_date
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.server_principals
+WHERE
+    type_desc = 'SERVER_ROLE'
+    AND is_fixed_role = 0
+    AND name <> 'public'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM sys.server_role_members AS rm
+        WHERE rm.role_principal_id = principal_id
+    )
+ORDER BY name;
+
+GO
+
+DECLARE @Check028Sql nvarchar(max) = N'
+SELECT
+    ''028'' AS [Check ID],
+    databases.name AS DatabaseName,
+    databases.is_trustworthy_on AS IsTrustworthyOn,
+    (
+        SELECT
+            databases.state_desc AS State,
+            databases.create_date,
+            databases.database_id
+        FOR XML PATH(''AdditionalInfo''), TYPE
+    ) AS AdditionalInfo
+FROM sys.databases AS databases
+WHERE databases.is_trustworthy_on = 1
+  AND databases.name <> N''msdb''';
+
+IF CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)),
+             CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS varchar(50))) - 1) AS int) >= 16
+BEGIN
+    SET @Check028Sql = @Check028Sql + N'
+  AND NOT EXISTS
+  (
+      SELECT 1
+      FROM sys.availability_groups AS availability_groups
+      WHERE availability_groups.is_contained = 1
+        AND databases.name =
+            CONCAT(availability_groups.name, N''_msdb'')
+  )';
+END;
+
+SET @Check028Sql = @Check028Sql + N'
+ORDER BY databases.name;';
+
+EXEC sys.sp_executesql @Check028Sql;
+
+GO
+
+SELECT
+    '031' AS [Check ID],
+    name AS DatabaseName,
+    CAST(is_db_chaining_on AS INT) AS IsDbChainingOn,
+    (
+        SELECT
+            state_desc AS State,
+            create_date,
+            database_id
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.databases
+WHERE is_db_chaining_on = 1
+  AND name NOT IN ('master', 'msdb', 'tempdb')
+ORDER BY name;
+
+GO
+
+SELECT
+    '034' AS [Check ID],
+    value AS ConfiguredValue,
+    value_in_use AS RunningValue
+FROM sys.configurations
+WHERE name = 'xp_cmdshell'
+AND (value = 1 OR value_in_use =  1)
+;
+
+GO
+
+SELECT
+    '036' AS [Check ID],
+    name AS ConfigurationName,
+    value AS ConfiguredValue,
+    (
+        SELECT
+            value_in_use AS RunningValue,
+            description
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.configurations
+WHERE name = 'Ad Hoc Distributed Queries'
+  AND (value = 1 OR value_in_use = 1)
+;
+
+GO
+
+SELECT
+    '038' AS [Check ID],
+    name AS ConfigurationName,
+    value AS ConfiguredValue,
+    (
+        SELECT
+            value_in_use AS RunningValue,
+            description
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.configurations
+WHERE name = 'Ole Automation Procedures'
+  AND (value = 1 OR value_in_use = 1)
+;
+
+GO
+
+DECLARE @ValidateLogins TABLE
+(
+    SID varbinary(85),
+    OrphanedUser SYSNAME
+);
+
+INSERT INTO @ValidateLogins
+EXEC sp_validatelogins;
+
+SELECT
+    '046' AS [Check ID],
+    SID AS SID,
+    OrphanedUser AS OrphanedUser
+FROM @ValidateLogins;
+
+GO
+
+DECLARE @NumberOfErrorLogs INT = NULL;
+DECLARE @RegReadResult INT = NULL;
+
+BEGIN TRY
+    EXEC @RegReadResult = master.dbo.xp_instance_regread
+        @rootkey = 'HKEY_LOCAL_MACHINE',
+        @key = N'Software\Microsoft\MSSQLServer\MSSQLServer',
+        @value_name = N'NumErrorLogs',
+        @value = @NumberOfErrorLogs OUTPUT;
+END TRY
+BEGIN CATCH
+    SET @RegReadResult = -1;
+    SET @NumberOfErrorLogs = NULL;
+END CATCH;
+
+SELECT
+    '050' AS [Check ID],
+    CASE
+        WHEN @RegReadResult <> 0 OR @NumberOfErrorLogs IS NULL THEN 'Not set. Using default.'
+        ELSE 'custom'
+    END AS ErrorLogConfigurationSource,
+    CASE
+        WHEN @RegReadResult <> 0 OR @NumberOfErrorLogs IS NULL THEN 7
+        ELSE @NumberOfErrorLogs + 1
+    END AS NumberOfErrorLogs;
+
+
+GO
+
+IF CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)),
+             CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS varchar(50))) - 1) AS int) >= 10
+BEGIN
+    DECLARE @sql nvarchar(max) = N'
+    ;WITH AllAuditActions AS
+    (
+        SELECT ''AUDIT_CHANGE_GROUP'' AS AuditActionName UNION ALL
+        SELECT ''DBCC_GROUP'' UNION ALL
+        SELECT ''SERVER_OBJECT_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_OBJECT_OWNERSHIP_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_OBJECT_PERMISSION_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_OPERATION_GROUP'' UNION ALL
+        SELECT ''SERVER_PERMISSION_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_PRINCIPAL_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_PRINCIPAL_IMPERSONATION_GROUP'' UNION ALL
+        SELECT ''SERVER_ROLE_MEMBER_CHANGE_GROUP'' UNION ALL
+        SELECT ''SERVER_STATE_CHANGE_GROUP'' UNION ALL
+        SELECT ''LOGIN_CHANGE_PASSWORD_GROUP'' UNION ALL
+        SELECT ''FAILED_LOGIN_GROUP'' UNION ALL
+        SELECT ''SUCCESSFUL_LOGIN_GROUP'' UNION ALL
+        SELECT ''FAILED_DATABASE_AUTHENTICATION_GROUP'' UNION ALL
+        SELECT ''DATABASE_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_OWNERSHIP_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_OBJECT_OWNERSHIP_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_OBJECT_PERMISSION_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_ROLE_MEMBER_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_PRINCIPAL_CHANGE_GROUP'' UNION ALL
+        SELECT ''DATABASE_PRINCIPAL_IMPERSONATION_GROUP'' UNION ALL
+        SELECT ''APPLICATION_ROLE_CHANGE_PASSWORD_GROUP''
+    ),
+    ConfiguredAuditDetails AS
+    (
+        SELECT
+            sa.name AS AuditName,
+            sa.is_state_enabled AS AuditEnabled,
+            sas.name AS AuditSpecificationName,
+            sas.is_state_enabled AS SpecificationEnabled,
+            sasd.audit_action_name AS AuditActionName
+        FROM sys.server_audit_specifications AS sas
+        JOIN sys.server_audits AS sa
+            ON sas.audit_guid = sa.audit_guid
+        JOIN sys.server_audit_specification_details AS sasd
+            ON sas.server_specification_id = sasd.server_specification_id
+    )
+    SELECT
+        ''059'' AS [Check ID],
+        aaa.AuditActionName AS AuditActionName,
+        CASE
+            WHEN cad.AuditActionName IS NULL THEN ''Not Covered''
+            WHEN cad.AuditEnabled = 0 AND cad.SpecificationEnabled = 0 THEN ''Covered but Audit AND Specification Disabled''
+            WHEN cad.AuditEnabled = 0 THEN ''Covered but Audit Disabled''
+            WHEN cad.SpecificationEnabled = 0 THEN ''Covered but Specification Disabled''
+        END AS AuditCoverageStatus,
+        (
+            SELECT
+                cad.AuditName,
+                cad.AuditEnabled,
+                cad.AuditSpecificationName,
+                cad.SpecificationEnabled
+            FOR XML PATH(''AdditionalInfo''), TYPE
+        ) AS AdditionalInfo
+    FROM AllAuditActions AS aaa
+    LEFT JOIN ConfiguredAuditDetails AS cad
+        ON aaa.AuditActionName = cad.AuditActionName
+    WHERE cad.AuditActionName IS NULL
+       OR cad.AuditEnabled = 0
+       OR cad.SpecificationEnabled = 0
+    ORDER BY aaa.AuditActionName;
+    ';
+
+    EXEC sys.sp_executesql @sql;
+END;
+
+GO
+
+DECLARE @InstanceName NVARCHAR(128);
+DECLARE @RegPath NVARCHAR(400);
+DECLARE @AuditLevel INT;
+
+SET @InstanceName = CAST(SERVERPROPERTY('InstanceName') AS NVARCHAR(128));
+
+SET @RegPath = N'SOFTWARE\Microsoft\MSSQLServer\MSSQLServer';
+
+EXEC master.dbo.xp_instance_regread
+    @rootkey = 'HKEY_LOCAL_MACHINE',
+    @key = @RegPath,
+    @value_name = 'AuditLevel',
+    @value = @AuditLevel OUTPUT;
+
+SELECT
+    '069' AS [Check ID],
+    @AuditLevel AS AuditLevel,
+    CASE @AuditLevel
+                        WHEN 0 THEN 'None'
+                        WHEN 2 THEN 'Failed logins only'
+                        WHEN 1 THEN 'Successful logins only'
+                        WHEN 3 THEN 'Both successful and failed logins'
+                        ELSE 'Unknown'
+                     END AS AuditLevelDescription
+	;
+GO
+
+DECLARE @DatabaseOwners TABLE
+(
+      dbname          sysname        NOT NULL
+    , matched_owner   nvarchar(128)  NULL
+);
+
+DECLARE @PreparedOwners TABLE
+(
+      database_id                      int             NULL
+    , dbname                           sysname         NOT NULL
+    , principal_id                     int             NULL
+    , principal_name                   sysname         NULL
+    , matched_owner                    nvarchar(128)   NULL
+    , server_principal_type            nvarchar(60)    NULL
+    , db_owner_valid                   varchar(20)     NOT NULL
+    , powerful_server_role_membership  varchar(30)     NULL
+);
+
+DECLARE
+      @dbname sysname
+    , @dbstate_desc nvarchar(60)
+    , @sql    nvarchar(max);
+DECLARE @SqlSafeExcludeModelDatabase bit = 0;
+
+DECLARE database_owner_cursor CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+    databases.name,
+    databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id = databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
+
+OPEN database_owner_cursor;
+
+FETCH NEXT FROM database_owner_cursor INTO @dbname, @dbstate_desc;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @sql = N'
+SELECT
+      @dbname AS dbname
+    , SUSER_SNAME(dp.sid) AS matched_owner
+FROM ' + QUOTENAME(@dbname) + N'.sys.database_principals AS dp
+WHERE dp.name = N''dbo'';
+';
+
+    INSERT INTO @DatabaseOwners
+    EXEC sys.sp_executesql
+          @sql
+        , N'@dbname sysname'
+        , @dbname = @dbname;
+
+    FETCH NEXT FROM database_owner_cursor INTO @dbname, @dbstate_desc;
+END;
+
+CLOSE database_owner_cursor;
+DEALLOCATE database_owner_cursor;
+
+INSERT INTO @PreparedOwners
+(
+      database_id
+    , dbname
+    , principal_id
+    , principal_name
+    , matched_owner
+    , server_principal_type
+    , db_owner_valid
+    , powerful_server_role_membership
+)
+SELECT
+      d.database_id
+    , dbo_src.dbname
+    , sp.principal_id
+    , sp.name AS principal_name
+    , dbo_src.matched_owner
+    , sp.type_desc AS server_principal_type
+    , CASE
+          WHEN dbo_src.matched_owner IS NULL THEN 'not valid (!)'
+          ELSE 'valid'
+      END AS db_owner_valid
+    , CASE
+          WHEN srm.role_principal_id = 3  THEN 'sysadmin'
+          WHEN srm.role_principal_id = 4  THEN 'securityadmin'
+          WHEN srm.role_principal_id = 5  THEN 'serveradmin'
+          WHEN srm.role_principal_id = 6  THEN 'setupadmin'
+          WHEN srm.role_principal_id = 7  THEN 'processadmin'
+          WHEN srm.role_principal_id = 8  THEN 'diskadmin'
+          WHEN srm.role_principal_id = 9  THEN 'dbcreator'
+          WHEN srm.role_principal_id = 10 THEN 'bulkadmin'
+          ELSE NULL
+      END AS powerful_server_role_membership
+FROM @DatabaseOwners AS dbo_src
+LEFT JOIN sys.databases AS d
+    ON dbo_src.dbname COLLATE SQL_Latin1_General_CP1_CI_AS
+     = d.name COLLATE SQL_Latin1_General_CP1_CI_AS
+LEFT JOIN sys.server_principals AS sp
+    ON d.owner_sid = sp.sid
+LEFT JOIN sys.server_role_members AS srm
+    ON sp.principal_id = srm.member_principal_id;
+
+SELECT
+      '072' AS [Check ID]
+    , dbname AS DatabaseName
+    , principal_name AS OwnerName
+    , (
+        SELECT
+              server_principal_type AS [Principal_Type]
+            , db_owner_valid
+            , powerful_server_role_membership
+        FOR XML PATH('AdditionalInfo'), TYPE
+      ) AS AdditionalInfo
+FROM @PreparedOwners
+WHERE powerful_server_role_membership = 'sysadmin'
+  AND dbname NOT IN ('master', 'msdb', 'tempdb', 'model')
+ORDER BY database_id ASC;
+
+SELECT
+      '078' AS [Check ID]
+    , dbname AS DatabaseName
+    , principal_name AS OwnerName
+    , (
+        SELECT
+              server_principal_type AS [Principal_Type]
+            , db_owner_valid
+            , powerful_server_role_membership
+        FOR XML PATH('AdditionalInfo'), TYPE
+      ) AS AdditionalInfo
+FROM @PreparedOwners
+WHERE server_principal_type = 'WINDOWS_LOGIN'
+ORDER BY database_id ASC;
+
+SELECT
+      '155' AS [Check ID]
+    , dbname AS DatabaseName
+    , matched_owner AS MatchedOwnerName
+    , (
+        SELECT
+              server_principal_type AS [Principal_Type]
+            , db_owner_valid
+            , powerful_server_role_membership
+        FOR XML PATH('AdditionalInfo'), TYPE
+      ) AS AdditionalInfo
+FROM @PreparedOwners
+WHERE db_owner_valid = 'not valid (!)'
+ORDER BY database_id ASC;
+
+GO
+
+SELECT
+    '079' AS [Check ID],
+    name AS LoginName,
+    is_disabled AS IsDisabled,
+    (
+        SELECT
+            modify_date
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.server_principals
+WHERE sid = 0x01;
+
+GO
+
+DECLARE @Check113 TABLE
+(
+      [Check ID]      varchar(10)
+    , DatabaseRoleName sysname
+    , PrincipalId     int
+    , AdditionalInfo  xml
+);
+
+DECLARE @DatabaseName113 sysname;
+DECLARE @DatabaseStateDesc113 nvarchar(60);
+DECLARE @Sql113 nvarchar(max);
+
+DECLARE db_cursor_113 CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+    databases.name,
+    databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id = databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
+
+OPEN db_cursor_113;
+FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113, @DatabaseStateDesc113;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @Sql113 = N'
+    SELECT
+          ''113''
+        , roles.name AS DatabaseRoleName
+        , roles.principal_id AS PrincipalId
+        , (
+            SELECT
+                  ''' + REPLACE(@DatabaseName113, '''', '''''') + ''' AS DatabaseName
+                , roles.create_date
+                , roles.owning_principal_id
+                , owners.name
+            FOR XML PATH(''AdditionalInfo''), TYPE
+          )
+    FROM ' + QUOTENAME(@DatabaseName113) + N'.sys.database_principals AS roles
+    LEFT JOIN ' + QUOTENAME(@DatabaseName113) + N'.sys.database_role_members AS members
+        ON roles.principal_id = members.role_principal_id
+    LEFT JOIN ' + QUOTENAME(@DatabaseName113) + N'.sys.database_principals AS owners
+        ON roles.owning_principal_id = owners.principal_id
+    WHERE roles.type = ''R''
+      AND members.member_principal_id IS NULL
+      AND roles.is_fixed_role = 0
+      AND roles.name <> ''public'';';
+
+    INSERT INTO @Check113
+    EXEC sys.sp_executesql @Sql113;
+
+    FETCH NEXT FROM db_cursor_113 INTO @DatabaseName113, @DatabaseStateDesc113;
+END
+
+CLOSE db_cursor_113;
+DEALLOCATE db_cursor_113;
+
+SELECT * FROM @Check113;
+
+GO
+
+DECLARE @Check129 TABLE
+(
+      [Check ID]       varchar(10)
+    , DatabaseUserName sysname
+    , PrincipalType    nvarchar(60)
+    , AdditionalInfo   xml
+);
+
+DECLARE @ContainedAvailabilityGroups129 TABLE
+(
+    GroupId uniqueidentifier PRIMARY KEY
+);
+
+DECLARE @DatabaseName129 sysname;
+DECLARE @DatabaseStateDesc129 nvarchar(60);
+DECLARE @Sql129 nvarchar(max);
+
+/*
+    The is_contained column exists only on SQL Server 2022 and later.
+    Dynamic SQL prevents compilation failure on older versions.
+*/
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.all_columns AS all_columns
+    WHERE all_columns.object_id =
+          OBJECT_ID(N'sys.availability_groups')
+      AND all_columns.name = N'is_contained'
+)
+BEGIN
+    INSERT INTO @ContainedAvailabilityGroups129
+    (
+        GroupId
+    )
+    EXEC sys.sp_executesql N'
+        SELECT
+            availability_groups.group_id
+        FROM sys.availability_groups AS availability_groups
+        WHERE availability_groups.is_contained = 1;';
+END;
+
+
+DECLARE db_cursor_129 CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+      databases.name
+    , databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states
+    AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id =
+       databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+LEFT JOIN sys.availability_databases_cluster
+    AS availability_databases_cluster
+    ON availability_databases_cluster.group_database_id =
+       databases.group_database_id
+LEFT JOIN @ContainedAvailabilityGroups129
+    AS contained_availability_groups
+    ON contained_availability_groups.GroupId =
+       availability_databases_cluster.group_id
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+
+  -- Exclude every database belonging to a contained AG,
+  -- including databases on the local primary replica.
+  AND contained_availability_groups.GroupId IS NULL
+
+  -- Include standalone databases and primary databases
+  -- belonging to ordinary availability groups.
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
+
+OPEN db_cursor_129;
+
+FETCH NEXT FROM db_cursor_129
+INTO @DatabaseName129, @DatabaseStateDesc129;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @Sql129 = N'
+    SELECT
+          ''129'' AS [Check ID]
+        , database_principals.name AS DatabaseUserName
+        , database_principals.type_desc AS PrincipalType
+        , (
+            SELECT
+                  ' + QUOTENAME(@DatabaseName129, '''') + N'
+                    AS DatabaseName
+                , database_principals.authentication_type_desc
+                    AS AuthType
+                , database_principals.create_date
+                , database_principals.modify_date
+            FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    FROM ' + QUOTENAME(@DatabaseName129) + N'.sys.database_principals AS database_principals
+    LEFT JOIN sys.server_principals AS server_principals
+        ON database_principals.sid = server_principals.sid
+    WHERE server_principals.sid IS NULL
+      AND database_principals.type IN (''S'', ''U'', ''G'')
+      AND database_principals.authentication_type <> 0
+      AND database_principals.name NOT IN
+          (''dbo'', ''guest'', ''INFORMATION_SCHEMA'', ''sys'');';
+
+    INSERT INTO @Check129
+    EXEC sys.sp_executesql @Sql129;
+
+    FETCH NEXT FROM db_cursor_129
+    INTO @DatabaseName129, @DatabaseStateDesc129;
+END
+
+CLOSE db_cursor_129;
+DEALLOCATE db_cursor_129;
+
+SELECT
+      [Check ID]
+    , DatabaseUserName
+    , PrincipalType
+    , AdditionalInfo
+FROM @Check129
+ORDER BY
+      AdditionalInfo.value(
+          '(/AdditionalInfo/DatabaseName/text())[1]',
+          'sysname'
+      )
+    , DatabaseUserName;
+
+GO
+
+SELECT
+    '123' AS [Check ID],
+    name AS DatabaseName,
+    is_auto_close_on AS IsAutoCloseOn,
+    (
+        SELECT
+            state_desc AS State,
+            create_date,
+            database_id
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.databases
+WHERE is_auto_close_on = 1
+ORDER BY name;
+
+GO
+
+
+DECLARE @ProductVersion NVARCHAR(20) = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(20));
+DECLARE @MajorVersion INT = CAST(PARSENAME(@ProductVersion, 4) AS INT);
+DECLARE @MinorVersion INT = CAST(PARSENAME(@ProductVersion, 3) AS INT);
+
+DECLARE @AvailabilityGroupCount NVARCHAR(100) = N'Not applicable - requires SQL Server 2012 or later';
+DECLARE @ContainedAvailabilityGroupCount NVARCHAR(100) = N'Not applicable - requires SQL Server 2022 or later';
+DECLARE @DynamicSql NVARCHAR(MAX);
+DECLARE @SqlSafeAwsRdsCompat bit = 0;
+DECLARE @RdsAdminDatabasePresent bit = 0;
+DECLARE @RdsAdminLoginPresent bit = 0;
+
+IF DB_ID(N'rdsadmin') IS NOT NULL
+BEGIN
+    SET @RdsAdminDatabasePresent = 1;
+END;
+
+IF SUSER_ID(N'rdsa') IS NOT NULL
+BEGIN
+    SET @RdsAdminLoginPresent = 1;
+END;
+
+IF @MajorVersion >= 11
+BEGIN
+    BEGIN TRY
+        SET @DynamicSql = N'SELECT @ValueOut = CONVERT(NVARCHAR(100), COUNT(*)) FROM sys.availability_groups;';
+        EXEC sys.sp_executesql
+            @DynamicSql,
+            N'@ValueOut NVARCHAR(100) OUTPUT',
+            @ValueOut = @AvailabilityGroupCount OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SET @AvailabilityGroupCount = N'Unavailable';
+    END CATCH;
+END;
+
+IF @MajorVersion >= 16
+BEGIN
+    BEGIN TRY
+        SET @DynamicSql = N'SELECT @ValueOut = CONVERT(NVARCHAR(100), COUNT(*)) FROM sys.availability_groups WHERE is_contained = 1;';
+        EXEC sys.sp_executesql
+            @DynamicSql,
+            N'@ValueOut NVARCHAR(100) OUTPUT',
+            @ValueOut = @ContainedAvailabilityGroupCount OUTPUT;
+    END TRY
+    BEGIN CATCH
+        SET @ContainedAvailabilityGroupCount = N'Unavailable';
+    END CATCH;
+END;
+
+DECLARE @SystemOverview TABLE
+(
+    SortOrder INT IDENTITY(1,1) NOT NULL,
+    Item NVARCHAR(100) NOT NULL,
+    Value NVARCHAR(260) NULL
+);
+
+INSERT INTO @SystemOverview (Item, Value)
+SELECT 'Product Major Version',
+       CONVERT(NVARCHAR(100), @MajorVersion)
+
+UNION ALL
+SELECT 'SQL Server Version',
+       CONVERT(NVARCHAR(100),
+           CASE
+               WHEN @MajorVersion = 17 THEN 'SQL Server 2025'
+               WHEN @MajorVersion = 16 THEN 'SQL Server 2022'
+               WHEN @MajorVersion = 15 THEN 'SQL Server 2019'
+               WHEN @MajorVersion = 14 THEN 'SQL Server 2017'
+               WHEN @MajorVersion = 13 THEN 'SQL Server 2016'
+               WHEN @MajorVersion = 12 THEN 'SQL Server 2014'
+               WHEN @MajorVersion = 11 THEN 'SQL Server 2012'
+               WHEN @MajorVersion = 10 AND @MinorVersion = 0  THEN 'SQL Server 2008'
+               WHEN @MajorVersion = 10 AND @MinorVersion = 50 THEN 'SQL Server 2008 R2'
+               WHEN @MajorVersion = 9  THEN 'SQL Server 2005'
+               WHEN @MajorVersion = 8  THEN 'SQL Server 2000'
+               ELSE 'Unknown Version'
+           END)
+
+UNION ALL
+SELECT 'Edition',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('Edition'))
+
+UNION ALL
+SELECT 'Product Level',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('ProductLevel'))
+
+UNION ALL
+SELECT 'Product Update Level',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('ProductUpdateLevel'))
+
+UNION ALL
+SELECT 'Version Number',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('ProductVersion'))
+
+UNION ALL
+SELECT 'Product Build Type',
+       COALESCE(CONVERT(NVARCHAR(100), SERVERPROPERTY('ProductBuildType')), 'N/A')
+
+UNION ALL
+SELECT 'Resource Last Update DateTime',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('ResourceLastUpdateDateTime'))
+
+UNION ALL
+SELECT 'Resource Version',
+       CONVERT(NVARCHAR(100), SERVERPROPERTY('ResourceVersion'))
+
+UNION ALL
+SELECT 'Engine Edition',
+       CONVERT(NVARCHAR(100),
+           CASE CAST(SERVERPROPERTY('EngineEdition') AS INT)
+               WHEN 1  THEN 'Personal or Desktop Engine'
+               WHEN 2  THEN 'Standard (Standard, Developer, Web, BI)'
+               WHEN 3  THEN 'Enterprise (Enterprise, Developer, Evaluation)'
+               WHEN 4  THEN 'Express (Express, Express with Tools, Advanced Services)'
+               WHEN 5  THEN 'SQL Database'
+               WHEN 6  THEN 'Azure Synapse Analytics'
+               WHEN 8  THEN 'Azure SQL Managed Instance'
+               WHEN 9  THEN 'Azure SQL Edge'
+               WHEN 11 THEN 'Azure Synapse serverless SQL pool / Microsoft Fabric'
+               WHEN 12 THEN 'Microsoft Fabric SQL database'
+               ELSE 'Unknown'
+           END)
+
+UNION ALL
+SELECT 'AWS RDS detected',
+       CONVERT(NVARCHAR(100),
+           CASE
+               WHEN @SqlSafeAwsRdsCompat = 1
+                AND @RdsAdminDatabasePresent = 1
+                AND @RdsAdminLoginPresent = 1
+               THEN 'Yes'
+               ELSE 'No'
+           END)
+
+UNION ALL
+SELECT 'SQL Server Service Start Time',
+       CONVERT(NVARCHAR(100), sqlserver_start_time)
+FROM sys.dm_os_sys_info
+
+UNION ALL
+SELECT 'Uptime',
+       CONVERT(NVARCHAR(100),
+           CAST(DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME()) / 24 AS NVARCHAR(10))
+           + ' days ' +
+           CAST(DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME()) % 24 AS NVARCHAR(10))
+           + ' hours'
+       )
+FROM sys.dm_os_sys_info
+
+UNION ALL
+SELECT 'Last Master Database Backup',
+       COALESCE(CONVERT(NVARCHAR(100), MAX(backup_finish_date)), 'N/A')
+FROM msdb.dbo.backupset
+WHERE database_name = 'master'
+
+UNION ALL
+SELECT 'Default Data Path',
+       CONVERT(NVARCHAR(260), SERVERPROPERTY('InstanceDefaultDataPath'))
+
+UNION ALL
+SELECT 'Default Log Path',
+       CONVERT(NVARCHAR(260), SERVERPROPERTY('InstanceDefaultLogPath'))
+
+UNION ALL
+SELECT 'Clustered',
+       CONVERT(NVARCHAR(100),
+           CASE SERVERPROPERTY('IsClustered')
+                WHEN 1 THEN 'Yes'
+                WHEN 0 THEN 'No'
+                ELSE 'Unknown'
+           END)
+
+UNION ALL
+SELECT 'HADR Enabled',
+       CONVERT(NVARCHAR(100),
+           CASE SERVERPROPERTY('IsHadrEnabled')
+                WHEN 1 THEN 'Yes'
+                WHEN 0 THEN 'No'
+                ELSE 'Unknown'
+           END)
+
+UNION ALL
+SELECT 'Number Availability Groups',
+       @AvailabilityGroupCount
+
+UNION ALL
+SELECT 'Number Contained Availability Groups',
+       @ContainedAvailabilityGroupCount
+
+UNION ALL
+SELECT 'Number Databases',
+       CONVERT(NVARCHAR(100), COUNT(*))
+FROM sys.databases
+
+UNION ALL
+SELECT 'Number Logins',
+       CONVERT(NVARCHAR(100), COUNT(*))
+FROM sys.server_principals
+WHERE type_desc IN ('SQL_LOGIN','WINDOWS_LOGIN','WINDOWS_GROUP')
+
+UNION ALL
+SELECT 'Current Active Connections',
+       CONVERT(NVARCHAR(100), COUNT(*))
+FROM sys.dm_exec_sessions
+WHERE is_user_process = 1;
+
+SELECT
+    '800' AS [Check ID],
+    Item,
+    Value
+FROM @SystemOverview
+ORDER BY SortOrder;
+
+GO
+
+IF CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS varchar(50)),
+             CHARINDEX('.', CAST(SERVERPROPERTY('ProductVersion') AS varchar(50))) - 1) AS int) >= 16
+BEGIN
+    DECLARE @sql nvarchar(max) = N'
+    ;WITH ContainedAvailabilityGroups AS
+    (
+        SELECT
+              availability_groups.name AS AvailabilityGroupName
+            , ISNULL(
+                  availability_group_listeners.dns_name
+                  + N'':''
+                  + CONVERT(nvarchar(10), availability_group_listeners.port),
+                  N''N/A''
+              ) AS ListenerName
+            , availability_group_listeners.is_conformant AS IsConformant
+        FROM sys.availability_groups
+        LEFT JOIN sys.availability_group_listeners
+            ON availability_group_listeners.group_id =
+               availability_groups.group_id
+        WHERE availability_groups.is_contained = 1
+    )
+    SELECT
+          ''802'' AS [Check ID]
+        , AvailabilityGroupName
+        , ListenerName
+        , (
+              SELECT
+                    IsConformant
+              FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    FROM ContainedAvailabilityGroups
+
+    UNION ALL
+
+    SELECT
+          ''802'' AS [Check ID]
+        , N''No Contained Availability Groups found''
+        , N''N/A''
+        , (
+              SELECT
+                    CONVERT(bit, NULL) AS IsConformant
+              FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    WHERE NOT EXISTS
+    (
+        SELECT 1
+        FROM ContainedAvailabilityGroups
+    )
+    ORDER BY AvailabilityGroupName;'
+    EXEC sys.sp_executesql @sql;
+END
+
+GO
+
+SELECT
+    '806' AS [Check ID],
+    name AS ConfigurationName,
+    value AS ConfiguredValue,
+    (
+        SELECT
+            value_in_use AS RunningValue,
+            description
+        FOR XML PATH('AdditionalInfo'), TYPE
+    ) AS AdditionalInfo
+FROM sys.configurations
+WHERE value_in_use <> value
+  AND name NOT LIKE '%server memory (MB)%';
+
+GO
+'@
+
+# --- EMBEDDED SQL VALIDATION ---
+Write-Log '--- Phase: Embedded SQL validation ---'
+$ActualEmbeddedSqlHash = Get-Sha256HashFromAwsql -Text $EmbeddedAssessmentSql
+
+if ($ActualEmbeddedSqlHash -ne $RequiredSql) {
+    Show-UiMessage -Message "The embedded SQL assessment script does not match the expected version. Execution has been stopped." -Kind Error
+    Set-SqlSafeExitCode 2
+    Write-AbortEntry
+    return
+}
+
+Write-Log "Embedded SQL integrity OK"
+Write-LogValue 'SQL hash' $ActualEmbeddedSqlHash
+
+# --- EXECUTION ---
+$AllowedCheckIds = @(
+    '800'
+    '802'
+    '806'
+    '002'
+    '003'
+    '004'
+    '006'
+    '028'
+    '031'
+    '034'
+    '036'
+    '038'
+    '050'
+    '072'
+    '078'
+    '123'
+    '129'
+    '155'
+    '011'
+    '015'
+    '026'
+    '027'
+    '008'
+    '010'
+    '079'
+    '113'
+    '046'
+    '059'
+    '069'
+)
+$AllowedCheckIdLookup = @{}
+foreach ($id in $AllowedCheckIds) { $AllowedCheckIdLookup[$id] = $true }
+
+$Catalog = @(
+    [pscustomobject]@{ 'Check ID' = '002'; SectionID = '6'; Section = 'Communication Security' },
+    [pscustomobject]@{ 'Check ID' = '003'; SectionID = '6'; Section = 'Communication Security' },
+    [pscustomobject]@{ 'Check ID' = '004'; SectionID = '6'; Section = 'Communication Security' },
+    [pscustomobject]@{ 'Check ID' = '006'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '008'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '010'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '011'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
+    [pscustomobject]@{ 'Check ID' = '015'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
+    [pscustomobject]@{ 'Check ID' = '026'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '027'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '028'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '031'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '034'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '036'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '038'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '046'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '050'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '059'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '069'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '072'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '078'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '079'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '113'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '123'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '129'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '155'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '800'; SectionID = '0'; Section = 'Information' },
+    [pscustomobject]@{ 'Check ID' = '802'; SectionID = '0'; Section = 'Information' },
+    [pscustomobject]@{ 'Check ID' = '806'; SectionID = '0'; Section = 'Information' }
+)
+
+$Rules = [ordered]@{
+    '800' = @{ Method = 'static'; Severity = 'INFO' }
+    '002' = @{ Method = 'column_equals'; Column = 'IsIntegratedSecurityOnly'; ExpectedValue = 0; Severity = 'OBSERVE' }
+    '003' = @{ Method = 'threshold_max'; Column = 'SqlAuthenticationSessionPercent'; Limit = 10; Severity = 'WARNING' }
+    '004' = @{ Method = 'threshold_max_stacked'; Column = 'NtlmAuthenticationSessionPercent'; Thresholds = @(@{ GreaterThan = 0; Severity = 'OBSERVE' }, @{ GreaterThanOrEqual = 10; Severity = 'WARNING' }, @{ GreaterThan = 30; Severity = 'FAIL' }) } # NTLM Authentication usage
+    '006' = @{ Method = 'rows_exist'; Severity = 'FAIL' }
+    '008' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' }
+    '010' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } 
+    '011' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '015' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } 
+    '026' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '027' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } 
+    '028' = @{ Method = 'rows_exist'; Severity = 'FAIL' }
+    '031' = @{ Method = 'rows_exist'; Severity = 'FAIL' }
+    '034' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '036' = @{ Method = 'rows_exist'; Severity = 'FAIL' } # Ad hoc distributed queries setting
+    '038' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '046' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '050' = @{ Method = 'threshold_min'; Column = 'NumberOfErrorLogs'; Limit = 30; Severity = 'WARNING' } 
+    '072' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' }
+    '078' = @{ Method = 'rows_exist'; Severity = 'WARNING' }
+    '059' = @{ Method = 'rows_exist'; Severity = 'FAIL' }
+    '069' = @{ Method = 'threshold_min'; Column = 'AuditLevel'; Limit = 2; Severity = 'WARNING' } 
+    '079' = @{ Method = 'static'; Severity = 'INFO' } 
+    '113' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } 
+    '123' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '155' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+	'129' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '802' = @{ Method = 'static'; Severity = 'INFO'; MinMajorVersion = 16 } 
+    '806' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+}
+
+$RecommendationLookup = @{
+    '800' = [pscustomobject]@{ CheckName = 'System Overview'; Recommendation = @'
+Make sure to keep SQL Server patched with the latest Security Updates. If you are using Contained Availability Groups, ensure to assess them in addition to the host.
+'@.Trim(); ReferenceTitle = 'Latest updates and version history for SQL Server'; ReferenceUrl = 'https://learn.microsoft.com/en-us/troubleshoot/sql/releases/download-and-install-latest-updates'; ReferenceTitle2 = 'What is a contained availability group?'; ReferenceUrl2 = 'https://learn.microsoft.com/en-us/sql/database-engine/availability-groups/windows/contained-availability-groups-overview?view=sql-server-ver17' }
+    '802' = [pscustomobject]@{ CheckName = 'Contained Availability Groups'; Recommendation = @'
+If contained availability groups are present, review the security and operational implications carefully, including identity handling to ensure that the Contained Availability Group is monitored and secured at the same level as the host.
+
+Important: Contained availability groups maintain security principals and metadata separately from the SQL Server instance. Checks that depend on this security context, such as identifying orphaned database users, must be executed through the contained availability group context to produce accurate results.
+'@.Trim(); ReferenceTitle = 'Why you should use SQL Server contained availability groups to save time - and why consultants may not tell you about them'; ReferenceUrl = 'https://andreas-wolter.com/en/2504_sqlserver_contained_availability_groups/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '806' = [pscustomobject]@{ CheckName = 'Outstanding configuration changes'; Recommendation = @'
+There are outstanding configuration changes pending. This means that some settings will only take effect after a server restart or after executing the RECONFIGURE statement. Ensure that you understand which settings will change and validate their impact before they are applied.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '002' = [pscustomobject]@{ CheckName = 'Authentication Mode'; Recommendation = @'
+SQL Authentication increases the attack surface because credentials must be stored, transmitted, and managed separately from the operating system. Whenever possible, prefer Windows Authentication, which integrates with Active Directory and supports centralized identity management, password policies, and stronger authentication mechanisms. If applications currently require SQL Authentication, work with the application vendor to enable support for Windows Authentication or modern identity solutions. Where SQL logins must remain in use, enforce strong password policies, disable unused accounts, and regularly monitor login activity.
+'@.Trim(); ReferenceTitle = 'Choose an authentication mode'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/choose-an-authentication-mode?view=sql-server-ver17'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '003' = [pscustomobject]@{ CheckName = 'SQL Authentication usage'; Recommendation = @'
+SQL Authentication increases the attack surface because credentials must be stored, transmitted, and managed separately from the operating system. Whenever possible, prefer Windows Authentication, which integrates with Active Directory and supports centralized identity management, password policies, and stronger authentication mechanisms. If applications currently require SQL Authentication, work with the application vendor to enable support for Windows Authentication or modern identity solutions. Where SQL logins must remain in use, enforce strong password policies, disable unused accounts, and regularly monitor login activity.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '004' = [pscustomobject]@{ CheckName = 'NTLM Authentication usage'; Recommendation = @'
+The scan observed connections which are still using NTLM. NTLM is on a deprecation path and provides weaker security compared to modern alternatives such as Kerberos. Reduce and phase out NTLM wherever possible by identifying affected clients and migrating them to Kerberos-based authentication.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '006' = [pscustomobject]@{ CheckName = 'SQL Logins without password policy enforcement'; Recommendation = @'
+One or more SQL Server logins are configured without password policy enforcement. This increases the risk of weak, reused, or non-compliant passwords being accepted for SQL authentication. Review the affected logins with the application owner or responsible user. Where SQL authentication is still required, set a compliant password and enable password policy enforcement using `CHECK_POLICY = ON`. Exceptions should be documented and limited to cases with a clear justification.
+'@.Trim(); ReferenceTitle = 'SQL Server - Password Policy'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/password-policy'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '028' = [pscustomobject]@{ CheckName = 'Databases with Trustworthy property set'; Recommendation = @'
+The assessment identified user databases with the TRUSTWORTHY property set to ON. This setting represents a significant security risk and is commonly classified as a high-severity finding. When a database is marked as TRUSTWORTHY, SQL Server implicitly trusts its contents, which can enable privilege escalation and unauthorized access to server-level resources. Determine the technical reason for this configuration and evaluate safer alternatives, such as module signing (code signing), to achieve the same functionality without relying on TRUSTWORTHY.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = 'TRUSTWORTHY database property'; ReferenceUrl2 = 'https://learn.microsoft.com/en-us/sql/relational-databases/security/trustworthy-database-property?view=sql-server-ver17' }
+    '031' = [pscustomobject]@{ CheckName = 'Cross Database ownership chaining setting'; Recommendation = @'
+The server-level cross-database ownership chaining setting is enabled. This configuration affects all databases on the instance and should be avoided, as it weakens isolation boundaries and enables privilege escalation with relatively little effort. If cross-database access is required, use the database-level setting only for specific databases that explicitly require it, and ensure the configuration is tightly controlled and well documented.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '034' = [pscustomobject]@{ CheckName = 'XP_cmdshell setting'; Recommendation = @'
+xp_cmdshell can be abused for command execution and lateral movement and should only be enabled temporarily when absolutely necessary. Disable it by default and document any approved exception with compensating controls.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '036' = [pscustomobject]@{ CheckName = 'Ad Hoc distributed queries setting'; Recommendation = @'
+The Ad Hoc Distributed Queries setting allows users to access external data sources directly using functions such as OPENROWSET and OPENDATASOURCE, significantly increasing the attack surface. It enables arbitrary connections to external or untrusted systems, facilitates data exfiltration, and may allow privilege escalation or code execution through vulnerable OLE DB providers under the SQL Server service account. In the event of compromise, it can also be used as a pivot point to access other systems on the network. Where external access is needed, prefer controlled mechanisms such as linked servers with defined security contexts. Disable this setting unless there is a clear and documented technical requirement. Due to the increased risk, consider isolating databases that require this setting on a dedicated SQL Server instance.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '038' = [pscustomobject]@{ CheckName = 'OLE Automation Procedures setting'; Recommendation = @'
+The OLE Automation Procedures setting allows Transact-SQL code to instantiate COM objects and interact with external Windows components. Enabling this feature represents a significant security risk, as it can be used by an attacker with database access to execute arbitrary commands, modify the registry, or read and write files - effectively bypassing standard SQL Server security boundaries and enabling privilege escalation under the SQL Server service account. Disable OLE Automation Procedures unless there is a strict and documented requirement. Where external interaction is needed, prefer safer alternatives such as SQL Server Agent jobs, CLR integration with strict permission sets, or application-layer logic outside the database. Ensure any required functionality is implemented using controlled, auditable mechanisms rather than direct OS-level access from within SQL Server.
+'@.Trim(); ReferenceTitle = 'OLE Automation stored procedures (Transact-SQL)'; ReferenceUrl = 'https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/ole-automation-stored-procedures-transact-sql?view=sql-server-ver17'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '050' = [pscustomobject]@{ CheckName = 'Number of Error Logs kept'; Recommendation = @'
+Fewer than 30 SQL Server error logs are being retained. Increase the setting to 90 to improve the available history for security investigations, troubleshooting, and forensic review. In practice, there is no downside for having one ErrorLog per day with 90 days history.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '072' = [pscustomobject]@{ CheckName = 'Database Owner sysadmin'; Recommendation = @'
+Some databases are owned by logins with sysadmin privileges. This can be abused by users with elevated permissions within the database to escalate privileges to the server level and should therefore be avoided. Use a dedicated, low-privileged login as the database owner instead. If using sa as a consistently available owner, ensure the associated risks are fully understood - especially in combination with settings such as TRUSTWORTHY or features that execute code as the database owner.
+'@.Trim(); ReferenceTitle = 'SQL Server Database Ownership: survey results & recommendations'; ReferenceUrl = 'https://andreas-wolter.com/en/sql-server-database-ownership-survey-results-recommendations/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '078' = [pscustomobject]@{ CheckName = 'Database Owner Windows Account'; Recommendation = @'
+Some databases are owned by Windows accounts. This can cause issues after restores to different servers or if the associated login is removed, and it often indicates weaknesses in database deployment processes. Ensure that all databases are owned by a consistently available account on every server.
+'@.Trim(); ReferenceTitle = 'SQL Server Database Ownership: survey results & recommendations'; ReferenceUrl = 'https://andreas-wolter.com/en/sql-server-database-ownership-survey-results-recommendations/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '123' = [pscustomobject]@{ CheckName = 'Databases with AUTO_CLOSE setting on'; Recommendation = @'
+The assessment identified databases with AUTO_CLOSE enabled. This setting can negatively impact performance by causing frequent resource initialization and may contribute to instability or enable denial-of-service scenarios. It should not be used on server systems and is only appropriate for limited use cases such as single-user or desktop environments.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '129' = [pscustomobject]@{ CheckName = 'Orphaned Database Users'; Recommendation = @'
+The assessment identified orphaned database users without a corresponding login. Review and remove or remap these users to reduce administrative overhead and prevent confusion or unintended permission issues. Orphaned users can also introduce risks such as privilege takeover and non-repudiation by misusing their identities.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '155' = [pscustomobject]@{ CheckName = 'Database Owner not valid'; Recommendation = @'
+Some databases do not have a valid owner mapping between the metadata in the master database and the user database. This can occur after a restore when the original owner login does not exist on the target system, or when the owner login has been removed. Such mismatches can lead to unexpected behavior or code execution issues. Ensure that every database has a valid and existing owner. The owner can be set in SSMS under Database - Properties - Files, or by using the ALTER AUTHORIZATION statement.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '011' = [pscustomobject]@{ CheckName = 'Server role membership with direct Elevation-of-Privilege Risk'; Recommendation = @'
+Members are not sysadmin, but can elevate to it through this role's privileges. Treat this membership like sysadmin and assign it only with the same level of scrutiny.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '015' = [pscustomobject]@{ CheckName = 'Powerful server role membership individual accounts'; Recommendation = @'
+Individual user accounts were found assigned to powerful server roles. Avoid assigning such privileges directly to personal accounts. Instead, use centrally managed Windows groups to reduce the risk of orphaned logins and improve access governance.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '026' = [pscustomobject]@{ CheckName = 'Server permissions granted to Logins'; Recommendation = @'
+The assessment identified individual accounts with server-level permissions. Avoid assigning such permissions directly to personal accounts. Instead, use centrally managed Windows groups to improve governance, simplify access control, and reduce the risk of orphaned logins.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '027' = [pscustomobject]@{ CheckName = 'Custom server roles without members'; Recommendation = @'
+The assessment identified custom server roles without any members. Review these roles and remove those that are no longer required to reduce clutter and maintain a clear and manageable security model.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '008' = [pscustomobject]@{ CheckName = 'SA Login Name'; Recommendation = @'
+Review the protection strategy for the built-in sa account carefully. Prioritize auditing both successful and failed logon attempts to detect misuse or attack activity early. Ensure all login attempts are logged, regularly reviewed, and integrated with centralized monitoring or alerting. Restrict direct use of sa to exceptional, well-justified cases and tightly control password exposure.
+'@.Trim(); ReferenceTitle = 'To rename or not, that is the question - how to protect SQL Server''s built-in sysadmin account sa'; ReferenceUrl = 'https://andreas-wolter.com/en/202512_renaming-sql-servers-sa-account/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '010' = [pscustomobject]@{ CheckName = 'Sysadmin-members individual accounts'; Recommendation = @'
+The assessment identified individual user accounts with sysadmin membership. Limit sysadmin privileges to tightly controlled administrative Windows groups managed in Active Directory, rather than assigning them directly to individual accounts.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '079' = [pscustomobject]@{ CheckName = 'SA Login State'; Recommendation = @'
+Disabling the sa account is not a universal best practice and should not be relied upon as a primary security control, as it can lead to unexpected issues during patching or due to script and application dependencies. Instead, ensure that auditing of failed login attempts - especially targeting sa - is properly configured and regularly reviewed to detect brute-force and unauthorized access attempts.
+'@.Trim(); ReferenceTitle = 'To rename or not, that is the question - how to protect SQL Server''s built-in sysadmin account sa'; ReferenceUrl = 'https://andreas-wolter.com/en/202512_renaming-sql-servers-sa-account/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '113' = [pscustomobject]@{ CheckName = 'Custom database roles without members'; Recommendation = @'
+The assessment found custom database roles without members. Review whether these roles are still needed and remove obsolete roles to keep the permission model understandable and clutter-free.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '046' = [pscustomobject]@{ CheckName = 'Orphaned Windows Logins'; Recommendation = @'
+The assessment found orphaned Windows logins that no longer exist in Active Directory. Review and remove them to reduce stale access paths and simplify access governance.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '059' = [pscustomobject]@{ CheckName = 'Security Auditing minimal setup'; Recommendation = @'
+Security auditing is insufficiently configured. At a minimum, monitor failed login attempts, permission changes, role membership changes, and other security-relevant activities. Refer to established guidance for a comprehensive set of audit actions to ensure adequate visibility into security events.
+'@.Trim(); ReferenceTitle = 'Recommendation for Security Auditing for databases - with example for Microsoft SQL Server'; ReferenceUrl = 'https://andreas-wolter.com/en/202507_recommended_security_auditing_databases_sql_server/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '069' = [pscustomobject]@{ CheckName = 'Basic Login-Failure logging status'; Recommendation = @'
+    Failed Logins are not Logged in the ErrorLog. Unless they are captured in an Audit, this should always be on.
+'@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+}
+
+$EmbeddedDetailsTemplateHtml = @'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="sqlaw" content="2026sql04">
+<title>SQL Server Security Assessment Community Edition</title>
+<style>
+body{font-family:Segoe UI, Arial, sans-serif;background:#f4f7f6;margin:40px;color:#333;}
+.page{max-width:1200px;margin:0 auto;min-height:calc(100vh - 80px);display:flex;flex-direction:column;}
+
+.report-header{margin-bottom:20px;padding:0;}
+.title-block{display:flex;flex-direction:column;gap:4px;}
+h1{margin:0;color:#2c3e50;font-size:2rem;line-height:1.1;}
+.header-subtitle{font-size:.98rem;color:#6b7280;font-weight:500;}
+
+.exec-header-box{display:flex;flex-direction:column;gap:14px;margin-bottom:20px;}
+.meta-strip{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin:0;width:100%}
+.meta-box{background:#f8f9fb;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;min-width:0}
+.meta-title{font-size:11px;text-transform:uppercase;color:#667085;margin-bottom:4px}
+.meta-value{font-size:14px;font-weight:600;color:#1f2937;word-break:break-word;overflow-wrap:anywhere}
+
+.visuals-panel,.controls,.detail-section,.category-summary-panel{background:white;box-shadow:0 2px 5px rgba(0,0,0,0.1);}
+.visuals-panel{margin-bottom:20px;padding:16px;page-break-inside:avoid;break-inside:avoid;}
+.visuals-title{font-size:1rem;font-weight:700;color:#2c3e50;margin:0 0 14px 0;}
+
+.chart-row{display:flex;align-items:flex-end;gap:14px;min-height:250px;}
+.chart-bars{display:flex;align-items:flex-end;gap:18px;flex:1;min-height:220px;padding:10px 6px 0 6px;border-bottom:1px solid #d9e2ea;}
+.chart-bar-wrap{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:8px;min-width:90px;flex:1;}
+.chart-track{position:relative;width:100%;max-width:100px;height:160px;background:#eef2f6;border-radius:14px 14px 0 0;overflow:hidden;display:flex;align-items:flex-end;}
+.chart-bar{position:relative;width:100%;min-height:8px;border-radius:14px 14px 0 0;}
+.chart-bar-pct-inside{position:absolute;left:50%;top:8px;transform:translateX(-50%);font-size:.82rem;font-weight:700;line-height:1;color:#fff;white-space:nowrap;pointer-events:none;text-shadow:0 1px 1px rgba(0,0,0,.25);}
+.chart-bar-pct-inside.dark-text{color:#212529;text-shadow:none;}
+.chart-label{font-size:.85rem;color:#5b6b79;font-weight:700;text-align:center;letter-spacing:.02em;}
+.chart-bar.outcome-PASS{background:#28a745;}
+.chart-bar.outcome-OBSERVE{background:#0ea5e9;}
+.chart-bar.outcome-WARNING{background:#ffc107;}
+.chart-bar.outcome-FAIL{background:#dc3545;}
+
+.controls{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:20px;padding:16px;}
+.controls-left,.controls-right{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
+.controls-label{font-weight:600;color:#2c3e50;margin-right:2px;}
+button{font:inherit;padding:10px 12px;border:1px solid #ccd3d9;border-radius:6px;background:#fff;cursor:pointer;}
+button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:not-allowed;}
+.filter-btn{font-weight:600;}
+.filter-btn.active{background:#2c3e50;color:#fff;border-color:#2c3e50;}
+
+.category-summary-panel{padding:16px;margin-bottom:20px;page-break-inside:avoid;break-inside:avoid;}
+.category-summary-title{font-size:1rem;font-weight:700;color:#2c3e50;margin:0 0 12px 0;}
+.category-summary-table-wrap{overflow-x:auto;}
+.category-summary-table{width:100%;min-width:560px;border-collapse:collapse;}
+.category-summary-table th{background:#34495e;color:white;padding:8px;border:1px solid #ddd;text-align:left;}
+.category-summary-table td{padding:8px;border:1px solid #ddd;background:#fff;}
+.category-summary-table th:not(:first-child),.category-summary-table td:not(:first-child){text-align:center;}
+.category-summary-table td:first-child{font-weight:600;color:#2c3e50;}
+.category-summary-count{font-weight:700;color:#111827;}
+.category-summary-count.status-FAIL{color:#dc3545;}
+.category-summary-count.outcome-zero{color:#111827;}
+.category-summary-count.indicator-count{font-weight:400;}
+.outcome-definitions{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb;}
+.outcome-definition{display:flex;gap:8px;align-items:flex-start;font-size:.85rem;color:#4b5563;line-height:1.35;}
+.outcome-definition-label{flex:0 0 auto;min-width:72px;text-align:center;padding:3px 7px;border-radius:4px;color:#fff;font-weight:700;font-size:.76rem;line-height:1.2;}
+.outcome-definition-label.outcome-WARNING{color:#212529;}
+
+.detail-section{padding:18px;margin-bottom:20px;}
+.compact-summary-table{width:100%;border-collapse:collapse;cursor:pointer;}
+.detail-section-static .compact-summary-table{cursor:default;}
+.compact-summary-table td{padding:10px;border:1px solid #ddd;background:#34495e;color:white;font-weight:bold;}
+.summary-check-id{width:60px;white-space:nowrap;font-size:.86rem;font-weight:600;}
+.summary-check-outcome{width:140px;text-align:center;}
+.summary-check-name{position:relative;padding-right:40px !important;}
+.summary-check-name::after{content:"\25BC";position:absolute;right:12px;top:50%;transform:translateY(-50%);}
+.detail-section.open .summary-check-name::after{content:"\25B2";}
+.detail-section-static .summary-check-name{padding-right:10px !important;}
+.detail-section-static .summary-check-name::after{content:"";}
+.detail-content{display:none;margin-top:15px;}
+.detail-section.open .detail-content{display:block;}
+.detail-table{border-collapse:collapse;width:100%;}
+.detail-table th{background:#34495e;color:white;padding:8px;border:1px solid #ddd;text-align:left;}
+.detail-table td{padding:8px;border:1px solid #ddd;}
+
+.xml-expand summary{cursor:pointer;font-weight:600;color:#2c3e50;}
+.xml-content{margin:8px 0 0 0;padding:10px;background:#f8f9fb;border:1px solid #e7eaee;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto;font-family:Consolas, Monaco, monospace;font-size:.85rem;}
+.additional-info-cell{min-width:280px;}
+
+.badge{padding:4px 8px;border-radius:4px;color:white;font-weight:bold;}
+.managed-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-left: 0.45rem;
+    padding: 0.12rem 0.45rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.3;
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+.managed-label-aws {
+    color: #1f3a5f;
+    background: #eef5ff;
+    border: 1px solid #b8d4f5;
+}
+
+.managed-label-dot {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: #ff9900;
+    display: inline-block;
+}
+.outcome-PASS,.section-dot.outcome-PASS{background:#28a745;}
+.outcome-OBSERVE,.section-dot.outcome-OBSERVE{background:#0ea5e9;}
+.outcome-FAIL,.section-dot.outcome-FAIL{background:#dc3545;}
+.outcome-WARNING,.section-dot.outcome-WARNING{background:#ffc107;color:#212529;}
+.outcome-INFO,.section-dot.outcome-INFO{background:#17a2b8;}
+.section-heading{margin:28px 0 10px;color:#2c3e50;border-bottom:2px solid #d9e2ea;padding-bottom:6px;}
+.recommendation-panel{margin-top:14px;padding:14px 16px;background:#fafbfd;border-left:5px solid #ccd3d9;}
+.recommendation-panel.outcome-FAIL{border-left-color:#dc3545;}
+.recommendation-panel.outcome-WARNING{border-left-color:#ffc107;}
+.recommendation-panel.outcome-INFO{border-left-color:#17a2b8;}
+.recommendation-title{font-weight:700;color:#2c3e50;margin-bottom:6px;}
+.recommendation-body{margin-bottom:6px;}
+.empty-detail{color:#5b6b79;}
+.hidden-by-filter{display:none !important;}
+
+.report-footer{margin-top:auto;padding:14px 0 2px;border-top:1px solid #e5e7eb;color:#9ca3af;font-size:11px;line-height:1.35;}
+.report-footer-inner{display:grid;grid-template-columns:1fr auto 1fr;align-items:end;gap:14px;}
+.footer-left,.footer-center,.footer-right{white-space:nowrap;}
+.footer-center{text-align:center;}
+.footer-right{text-align:right;}
+.footer-logo{height:32px;vertical-align:middle;margin-right:8px;opacity:.75;}
+.footer-muted{display:block;}
+
+@media print {
+    body{background:#fff;margin:20px 24px;}
+    .page{min-height:auto;}
+    .visuals-panel,.controls,.detail-section,.category-summary-panel,.meta-box{box-shadow:none;}
+    .visuals-panel{page-break-inside:avoid;break-inside:avoid;}
+    .chart-bar,.chart-track,.footer-logo{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+    .report-footer{position:fixed;bottom:0;left:0;right:0;padding:10px 24px 2px;background:#fff;}
+}
+
+@media (max-width: 900px){
+    .meta-strip{grid-template-columns:1fr 1fr;}
+    .report-footer-inner{grid-template-columns:1fr;gap:6px;}
+    .footer-left,.footer-center,.footer-right{text-align:left;white-space:normal;}
+}
+@media (max-width: 720px){
+    .controls{flex-direction:column;align-items:stretch;}
+    .controls-left,.controls-right{width:100%;}
+    .chart-bars{gap:10px;}
+    .chart-bar-wrap{min-width:64px;}
+}
+</style>
+</head>
+<body>
+<div class="page">
+<div class='report-header'>
+    <div class='title-block'>
+        <h1>SQL Server Security Assessment</h1>
+        <div class='header-subtitle'>Scope: High-Level Security Indicators (Community Edition) | Version: {RELEASE_VERSION}</div>
+    </div>
+</div>
+
+<div class='exec-header-box'>
+    <div class='meta-strip'>
+        <div class='meta-box'><div class='meta-title'>Core Security Controls</div><div class='meta-value'>{CHECK_COUNT}</div></div>
+        <div class='meta-box'><div class='meta-title'>Sections Analyzed</div><div class='meta-value'>{SECTION_COUNT}</div></div>
+        <div class='meta-box'><div class='meta-title'>Report Date</div><div class='meta-value'>{REPORT_DATE}</div></div>
+        <div class='meta-box'><div class='meta-title'>Target Server</div><div class='meta-value'>{TARGET_SERVER}</div></div>
+    </div>
+</div>
+
+<div class="visuals-panel">
+    <div class="visuals-title">Outcome Distribution</div>
+    <div class="chart-row">
+        <div class="chart-bars">
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-PASS" id="bar-pass" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-pass-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">PASS (<span id="bar-pass-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-OBSERVE" id="bar-observe" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-observe-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">OBSERVE (<span id="bar-observe-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-WARNING" id="bar-warning" style="height:0%;">
+                        <div class="chart-bar-pct-inside dark-text" id="bar-warning-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">WARNING (<span id="bar-warning-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-FAIL" id="bar-fail" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-fail-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">FAIL (<span id="bar-fail-value">0</span>)</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="controls detail-controls">
+    <div class="controls-left">
+        <div class="controls-label">Filter results by Outcome</div>
+        <button class="filter-btn active" type="button" data-filter="ALL">All</button>
+        <button class="filter-btn" type="button" data-filter="PASS">PASS</button>
+        <button class="filter-btn" type="button" data-filter="OBSERVE">OBSERVE</button>
+        <button class="filter-btn" type="button" data-filter="WARNING">WARNING</button>
+        <button class="filter-btn" type="button" data-filter="FAIL">FAIL</button>
+        <button class="filter-btn" type="button" data-filter="INFO">INFO</button>
+    </div>
+    <div class="controls-right">
+        <button id="expandAll" type="button">Expand All</button>
+        <button id="collapseAll" type="button" class="disabled-btn" disabled>Collapse All</button>
+    </div>
+</div>
+
+<!--DETAIL_BODY-->
+
+<div class="report-footer">
+    <div class="report-footer-inner">
+        <div class="footer-left">
+            <a href="https://www.SarpedonQualityLab.US/resources" target="_blank" rel="noopener noreferrer"><img class="footer-logo" src="data:image/png;base64,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" alt="Sarpedon Quality Lab Logo" /></a>
+        </div>
+        <div class="footer-center">
+            Community Edition
+            <span class="footer-muted">Version {RELEASE_VERSION}</span>
+        </div>
+        <div class="footer-right">
+            Logic &amp; Engine by <a href="https://www.andreas-wolter.com" target="_blank" rel="noopener noreferrer">Andreas Wolter</a> (MCSM)
+            <span class="footer-muted">&#169; 2026 Sarpedon Quality Lab US</span>
+        </div>
+    </div>
+</div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function(){
+const sections = Array.from(document.querySelectorAll('.detail-section'));
+const filterButtons = Array.from(document.querySelectorAll('.filter-btn'));
+const expandBtn = document.getElementById('expandAll');
+const collapseBtn = document.getElementById('collapseAll');
+let activeOutcome = 'ALL';
+
+function setExpanded(section, val){ if(!section) return; if(val) section.classList.add('open'); else section.classList.remove('open'); }
+function getOutcome(section){ const badge = section.querySelector('.summary-check-outcome .badge'); return badge ? badge.textContent.trim().toUpperCase() : ''; }
+function visibleSections(){ return sections.filter(s => !s.classList.contains('hidden-by-filter')); }
+function expandableSections(){ return visibleSections().filter(s => !s.classList.contains('detail-section-static')); }
+
+function updateButtons(){
+    const visible = expandableSections();
+    const anyVisibleOpen = visible.some(s => s.classList.contains('open'));
+    if (expandBtn) {
+        expandBtn.disabled = visible.length === 0 || anyVisibleOpen;
+        expandBtn.classList.toggle('disabled-btn', expandBtn.disabled);
+    }
+    if (collapseBtn) {
+        collapseBtn.disabled = visible.length === 0 || !anyVisibleOpen;
+        collapseBtn.classList.toggle('disabled-btn', collapseBtn.disabled);
+    }
+}
+
+function pct(count, total){
+    if (!total) return '0%';
+    return Math.round((count / total) * 100) + '%';
+}
+
+function setText(id, value){
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+}
+
+function setBar(id, count, maxCount){
+    const el = document.getElementById(id);
+    if (!el) return;
+    const height = maxCount > 0 ? Math.max(8, Math.round((count / maxCount) * 100)) : 0;
+    el.style.height = (count > 0 ? height : 0) + '%';
+}
+
+function updateVisuals(){
+    const order = ['PASS','OBSERVE','WARNING','FAIL'];
+    const counts = {PASS:0, OBSERVE:0, WARNING:0, FAIL:0};
+    sections.forEach(section => {
+        const outcome = getOutcome(section);
+        if (counts.hasOwnProperty(outcome)) counts[outcome] += 1;
+    });
+    const total = order.reduce((a, k) => a + counts[k], 0);
+    const maxCount = Math.max(0, ...order.map(k => counts[k]));
+
+    setText('bar-pass-value', counts.PASS);
+    setText('bar-observe-value', counts.OBSERVE);
+    setText('bar-warning-value', counts.WARNING);
+    setText('bar-fail-value', counts.FAIL);
+
+    setText('bar-pass-pct', pct(counts.PASS, total));
+    setText('bar-observe-pct', pct(counts.OBSERVE, total));
+    setText('bar-warning-pct', pct(counts.WARNING, total));
+    setText('bar-fail-pct', pct(counts.FAIL, total));
+
+    setBar('bar-pass', counts.PASS, maxCount);
+    setBar('bar-observe', counts.OBSERVE, maxCount);
+    setBar('bar-warning', counts.WARNING, maxCount);
+    setBar('bar-fail', counts.FAIL, maxCount);
+}
+
+function applyFilters(){
+    sections.forEach(section => {
+        const oc = getOutcome(section);
+        const show = activeOutcome === 'ALL' || oc === activeOutcome;
+        section.classList.toggle('hidden-by-filter', !show);
+    });
+    updateButtons();
+}
+
+sections.forEach(section => {
+    const summary = section.querySelector('.compact-summary-table');
+    if (summary && !section.classList.contains('detail-section-static')) {
+        summary.addEventListener('click', function(){
+            section.classList.toggle('open');
+            updateButtons();
+        });
+    }
+});
+
+filterButtons.forEach(btn => {
+    btn.addEventListener('click', function(){
+        activeOutcome = (btn.getAttribute('data-filter') || 'ALL').toUpperCase();
+        filterButtons.forEach(b => b.classList.toggle('active', b === btn));
+        applyFilters();
+    });
+});
+
+if (expandBtn) {
+    expandBtn.addEventListener('click', function(){
+        expandableSections().forEach(section => setExpanded(section, true));
+        updateButtons();
+    });
+}
+
+if (collapseBtn) {
+    collapseBtn.addEventListener('click', function(){
+        sections.forEach(section => setExpanded(section, false));
+        updateButtons();
+    });
+}
+
+updateVisuals();
+applyFilters();
+updateButtons();
+});
+</script>
+</body>
+</html>
+
+'@
 
 
 
 
+if (-not $ConsoleOnly) {
+
+try {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase -ErrorAction Stop
+}
+catch {
+    Stop-SqlSafeRun -Message ("The graphical logon dialog could not be loaded. Run with -ConsoleOnly or -SqlInstance. Error: {0}" -f $_.Exception.Message) -ExitCode 2
+    return
+}
+
+# --- logon dialog ---
+[xml]$XAML = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="SQL Server Security Assessment - Community Edition ($ReleaseVersion)" Width="560" Height="320"
+        WindowStartupLocation="CenterScreen" Background="#F4F7F6" ResizeMode="NoResize"
+        SizeToContent="Height" MinWidth="560">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,6">
+            <TextBlock Text="Connect to SQL Server" FontSize="16" FontWeight="Bold" Foreground="#2C3E50" Margin="0,0,0,2"/>
+            <Grid Margin="0,4,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Server:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                <TextBox Name="ServerInput" Grid.Column="1" Text="localhost" FontSize="13" Padding="4,3,4,3" BorderBrush="#3498DB" BorderThickness="1.2"/>
+            </Grid>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1">
+            <Grid Margin="0,2,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Authentication:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                <ComboBox Name="AuthDropdown" Grid.Column="1" FontSize="11" SelectedIndex="0">
+                    <ComboBoxItem Content="Windows Authentication" Tag="Windows"/>
+                    <ComboBoxItem Content="SQL Server Authentication" Tag="SQL"/>
+                </ComboBox>
+            </Grid>
+
+            <Grid Margin="0,6,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Windows User:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                <TextBlock Name="WinUserLabel" Grid.Column="1" Text="" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+            </Grid>
+
+            <Grid Margin="0,6,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Username:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                <TextBox Name="UsernameInput" Grid.Column="1" FontSize="13" Padding="4" Height="24" IsEnabled="False"/>
+            </Grid>
+
+            <Grid Margin="0,6,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Password:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                <PasswordBox Name="PasswordInput" Grid.Column="1" FontSize="13" Padding="4" Height="24" Width="Auto" IsEnabled="False"/>
+            </Grid>
+
+            <Expander Name="AdvancedExpander" Header="Advanced" Margin="0,6,0,0" FontSize="11" ToolTip="Older SQL Server versions may not support modern encryption modes.">
+                <Border Background="#FFFFFF" BorderBrush="#D6DBDF" BorderThickness="1" CornerRadius="4" Padding="8" Margin="0,6,0,0" MinWidth="360">
+                    <StackPanel>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Encryption:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <ComboBox Name="EncryptOption" Grid.Column="1" SelectedIndex="1" FontSize="13" Height="24">
+                                <ComboBoxItem Content="Mandatory" Tag="Mandatory"/>
+                                <ComboBoxItem Content="Optional" Tag="Optional"/>
+                            </ComboBox>
+                        </Grid>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Certificate:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="TrustCert" Grid.Column="1" Content="Trust server certificate" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid Margin="0,0,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Compatibility:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="SkipSecurityAdminChecks" Grid.Column="1" Content="Skip checks that require securityadmin-role membership" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="AwsRdsCompatChecks" Grid.Column="1" Content="AWS RDS Compat. Checks only" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+            </Expander>
+        </StackPanel>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button Name="TestBtn" Content="Test Connection and Permissions" Width="200" Height="26" Margin="0,0,6,0"/>
+            <Button Name="CancelBtn" Content="Cancel" Width="80" Height="26" Margin="0,0,6,0" IsCancel="True"/>
+            <Button Name="ConnectBtn" Content="Start Assessment" Width="125" Height="26" Background="#3498DB" Foreground="White" IsDefault="True"/>
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+
+# --- Load XAML ---
+$Reader = New-Object System.Xml.XmlNodeReader($XAML)
+$Window = [Windows.Markup.XamlReader]::Load($Reader)
+# --- Set window icon from embedded base64 ---
+$iconBase64 = 'AAABAAEA8gAAAAEAIAAo6AMAFgAAACgAAADyAAAAAAIAAAEAIAAAAAAAAMgDACMuAAAjLgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAt93CALfdwgC33cIAt93CALnewwCf0q4Ab7yEAHG9hgBxvYYAcb2GAHG9hgBxvYYAcb6GAHG+hgBxvoYAcb6GAHG+hgBxvoYAcb6GAHG+hgBxvoYAcb6GAHG+hgBxvoYAcb6GAHG+hgBxvoYAcb6GAHG9hgBxvYYAcb2GAHG9hgBwvIUApdWyALjewwC33cIAt93CALfdwgC33cIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAObMqwDmzKsA5syrAObMqwDmzKsA5syrAObMqwDlyaYA0J1eAM6ZVwDOmVcAzplXAM6ZVwDOmVcAzplXAM6ZVwDOmVcAzplXAM6ZVwDOmVcA0aBiAOXLqQDmzKsA5syrAObMqwDmzKsA5syrAObMqwDmzKsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgAEIAAAAAAAAAAAAAEAMAAAAAgAQAAAAgAAIAQQAABMQCogBRO8lgSCHEIgEiVCC0gdijJTzYIcDkYgjKQAAExAKiAFE7yWBIIcQgAAAAAASB2KMlPNghwORiCMpAAATEAqIAUTvJYEggAAAAAAAAAAAIoyU82CHA5GIIykAAAgAIAAhgUAAACAAAAAAAAAAAAAAAAAABAgQAMAAAAACExgLiAAAaCAAAAAAAAAAAAAAAAAAAFMAAYEQCAMiAACAgAEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAIAQQAAhMYC4gAAGgAAAAAAAAAAAAAAAAAAAAAAAGBEAgDIgAAChQ2giHFQAAAAAAAAAAAAAAAAAAAAAABjhLxwASJAAITGAuIAAAAAAAAAAAAAAAAAAAAAAAAAAABgRAIAyIAABMQCogAAAAAAAAAAAAAAAAAAAAAAAAAAAADkYgjKQACExgLiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEQCAMiAAITGAuIAAAAAAAAAAAAAAAAAAAAAAAAAAAAARAIAyIAAAoUNoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAccAEiQAACAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAITGAuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAyIAABMQCgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYgjKQAAChQ0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQASJAAAKFDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAAoUMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBAACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBAAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAACAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEEAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAAoUAAAAAAAAAAAAAIjoBJA0MQAAAAAAAAAAAAAEiQAAExAAAAAAAAAAAIcQiASJUILSB2KAAAAAAAAAACMpAAAKFAAAAAAAABA9UgCIAAAAADFDAIiAAAAAAAAABIkAABMQAAAAAAElgSAAAAAAAAAAAAAADJTzAAAAAAAjKQACExgAAAAAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIIykAABMQCgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIgjKQAAChQwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBAAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAACAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIIykAABMQCgAABO8lgSCHEIgEiVCC0gdijJTzYAAAAIgjKQAAExAKiAFE7AAAAAAAAAAAAAAAAAAAAABghwORiCMpAAAKFDYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgjKQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEEAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAACAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAACAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEEAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAAKFDYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADABIkAAAoUNoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAEiQAAExAAiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGQCCMpAAITGAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAyIAABMQAAABQAAAAAAAAAAAAAAAAAAAAAAAAAcAAAAjKQAAExAAAAFE6AAAAAAAAAAAAAAAAAAAAAAghwAAACMpAAATEAAAAATvJYAAAAAAAAAAAAAAAAAA82CAAAAAIykAAICAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAABBAAAExAAAAAAAAABIIcQiAAAAALSB2KMgAAAAAAAACMpAAAKFAAAAAAAAAAAUgCI6ASQNDFDAAAAAAAAAAAABIkAAAoUAAAAAAAAAAAAAADoBJA0AAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAChQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAAoUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEiQACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAITGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyIAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADIgACExgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMiAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAACAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQQAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEEAAATEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIykAABMQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjKQAAExAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMpAAAKFCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABIkAAhMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgDIgAAChQwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASJAAITGAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAyIAAAoUNgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcAEiQAAExAKgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABiCMpAAATEAqAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABGIIykAABMQCogAAAAAAAAAAAAAAAAAAAAAAAAAAAAAkYgjKQAAExAKiAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGRiCMpAAATEAqIAAAAAAAAAAAAAAAAAAAAAAAAAAAAA5GIIykAAAgAIAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAQAMAAAAAAChQ2giHAAAAAAAAAAAAAAAAAAAAAAAAADhLxwASJAAATEAqIAUQAAAAAAAAAAAAAAAAAAAAAAAAHA5GIIykAABMQCogBROAAAAAAAAAAAAAAAAAAAAAAAIcDkYgjKQAAChQ2giHFagAAAAAAAAAAAAAAAAAAAABljhLxwASJAAITGAuIAABoIAAAAAAAAAAAAAAAAAAQUwABgRAIAyIAAAoUNoIhxWpiEDgAAAAAAAAAAAAACIAwZY4S8cAEiQACExgLiAAAaCABAIYAAAAAAAAAAEKEEFMAAYEQCAMiAAAIACAAIYFAAAAhEAAAgAAAACCCAAAAAAQIEADAAAAAAAoUNoIhxWpiED1SAIjoBJA0MUMAiIAwZY4S8cAEiQAAExAKiAFE7yWBIIcQiASJUILSB2KMlPNghwORiCMpAAATEAqIAUTvJYEghxCIBIlQgtIHYoyU82CHA5GIIykAABMQCogBRO8lgSCHEIgEiVCC0gdijJTzYIcDkYgjKQAAExAKiAFE7yWBIIcQiASJUILSB2KMlPNghwORiCMpAAAKFDaCIcVqYhA9UgCI6ASQNDFDAIiAMGWOEvHABIkAA'
+$iconBytes = [System.Convert]::FromBase64String($iconBase64)
+$iconStream = [System.IO.MemoryStream]::new($iconBytes)
+$Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create($iconStream)
+# --- End icon ---
+
+# --- Find controls ---
+$ServerInput      = $Window.FindName('ServerInput')
+$AuthDropdown     = $Window.FindName('AuthDropdown')
+$UsernameInput    = $Window.FindName('UsernameInput')
+$PasswordInput    = $Window.FindName('PasswordInput')
+$EncryptOption    = $Window.FindName('EncryptOption')
+$TrustCert        = $Window.FindName('TrustCert')
+$SkipSecurityAdminChecks = $Window.FindName('SkipSecurityAdminChecks')
+$AwsRdsCompatChecks = $Window.FindName('AwsRdsCompatChecks')
+$ConnectBtn       = $Window.FindName('ConnectBtn')
+$CancelBtn        = $Window.FindName('CancelBtn')
+$TestBtn          = $Window.FindName('TestBtn')
+$WinUserLabel     = $Window.FindName('WinUserLabel')
+# --- Show current Windows user for Windows Auth ---
+$CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$WinUserLabel.Text = $CurrentUser
+
+# --- Enable/Disable username/password based on auth selection ---
+$AuthDropdown.Add_SelectionChanged({
+    $isSql = ($AuthDropdown.SelectedItem -and [string]$AuthDropdown.SelectedItem.Tag -eq 'SQL')
+    $UsernameInput.IsEnabled = $isSql
+    $PasswordInput.IsEnabled = $isSql
+    if (-not $isSql) {
+        $UsernameInput.Text = ''
+        $PasswordInput.Password = ''
+        $WinUserLabel.Visibility = 'Visible'
+    }
+    else {
+        $WinUserLabel.Visibility = 'Collapsed'
+    }
+})
+
+# --- Keyboard polish / initial focus ---
+$Window.Add_ContentRendered({
+    $this.Topmost = $true
+    $this.Activate()
+    $ServerInput.Focus() | Out-Null
+    $ServerInput.SelectAll()
+    $this.Topmost = $false
+})
+
+# --- Button actions ---
+$ConnectBtn.Add_Click({
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
+    $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
+
+    if ($validationMessage) {
+        Show-UiMessage -Message $validationMessage -Kind Warning
+        return
+    }
+
+    $script:SqlServer     = $dialogInput.SqlServer
+    $script:AuthMethod    = $dialogInput.AuthMethod
+    $script:Username      = $dialogInput.Username
+    $script:Password      = $dialogInput.Password
+    $script:EncryptOption = $dialogInput.EncryptOption
+    $script:TrustCert     = $dialogInput.TrustCert
+    $script:SkipChecks    = @($dialogInput.SkipChecks)
+    $script:AwsRdsCompat = [bool]$dialogInput.AwsRdsCompat
+    $Window.DialogResult = $true
+    $Window.Close()
+})
+
+$TestBtn.Add_Click({
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
+    $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
+
+    if ($validationMessage) {
+        Show-UiMessage -Message $validationMessage -Kind Warning
+        return
+    }
+
+    try {
+        $connectionResult = Test-SqlConnection -InputObject $dialogInput
+
+        if ($null -eq $connectionResult) {
+            Show-UiMessage -Message 'Connection succeeded, but the version probe returned no data.' -Title 'Connection Test Warning' -Kind Warning
+            return
+        }
+
+        $permissionResult = Invoke-SqlPermissionCheck -InputObject $dialogInput
+        $permissionMessage = Format-SqlPermissionCheckMessage -PermissionResult $permissionResult
+
+        $message = @(
+            'Connection succeeded.',
+            '',
+            $permissionMessage
+        ) -join [Environment]::NewLine
+
+        if ($permissionResult.HasInsufficientAccess) {
+            Show-UiMessage -Message $message -Title 'Connection Succeeded - Permission Warning' -Kind Warning
+        }
+        else {
+            Show-UiMessage -Message $message -Title 'Connection and Permission Check Passed' -Kind Info
+        }
+    }
+    catch {
+        Show-UiMessage -Message ("Connection or permission check failed.`n`n{0}" -f $_.Exception.Message) -Title 'Connection / Permission Check Failed' -Kind Error
+    }
+})
+
+$CancelBtn.Add_Click({
+    $Window.DialogResult = $false
+    $Window.Close()
+})
+
+} # end if (-not $ConsoleOnly) - WPF window setup
+
+# --- Show dialog ---
+if ($ConsoleOnly) {
+    Write-Log '--- Phase: Console-only connection ---'
+
+    if ([string]::IsNullOrWhiteSpace($SqlInstance)) {
+        Write-Log '-SqlInstance is required when using -ConsoleOnly.' -AlwaysShow
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+        return
+    }
+
+    if ($Auth -eq 'SQL' -and [string]::IsNullOrWhiteSpace($SqlUser)) {
+        Write-Log '-SqlUser is required when -Auth SQL is used.' -AlwaysShow
+        Set-SqlSafeExitCode 2
+        Write-AbortEntry
+        return
+    }
+
+    if ($Auth -eq 'SQL') {
+        if ($null -ne $SqlPass -and $SqlPass.Length -gt 0) {
+            $securePass = $SqlPass
+        } else {
+            $securePass = Read-Host -Prompt "Password for '$SqlUser'" -AsSecureString
+        }
+        $securePass.MakeReadOnly()
+    } else {
+        $securePass = [System.Security.SecureString]::new()
+    }
+
+    $SqlServer     = $SqlInstance
+    $AuthMethod    = $Auth
+    $Username      = if ($Auth -eq 'SQL') { $SqlUser } else { '' }
+    $Password      = $securePass
+    $EncryptOption = $Encrypt
+    $TrustCert     = $TrustServerCert.IsPresent
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $SkipChecks)
+}
+else {
+    Write-Log '--- Phase: Logon dialog ---'
+    $dialogResult = $Window.ShowDialog()
+
+    if (-not $dialogResult -or [string]::IsNullOrWhiteSpace([string]$script:SqlServer)) {
+        Show-UiMessage -Message 'No SQL Server connection details were provided. The assessment was cancelled.' -Kind Warning
+        return
+    }
+
+    $SqlServer     = [string]$script:SqlServer
+    $AuthMethod    = [string]$script:AuthMethod
+    $Username      = [string]$script:Username
+    $Password      = $script:Password
+    $EncryptOption = [string]$script:EncryptOption
+    $TrustCert     = [bool]$script:TrustCert
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $script:SkipChecks)
+    $AwsRdsCompat = [bool]$script:AwsRdsCompat
+}
+
+if ($AwsRdsCompat) {
+    $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks @($ActiveSkipChecks + '046'))
+}
+
+Write-Log "--- Phase: Connecting to SQL Server ---"
+Write-LogValue 'Target SQL Server' $SqlServer
+Write-LogValue 'Authentication'    $AuthMethod
+Write-LogValue 'Encryption'        $EncryptOption
+Write-LogValue 'Trust server cert' $TrustCert
+Write-LogValue 'AWS RDS compat'    ([bool]$AwsRdsCompat)
+if ($ActiveSkipChecks.Count -gt 0) {
+    Write-LogValue 'Skipped checks' ($ActiveSkipChecks -join ', ')
+}
+
+$SqlServerDisplay = Format-ServerName $SqlServer
+
+$TimeStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+$ReportDateDisplay = Get-Date -Format 'yyyy-MM-dd HH:mm'
+$ScopeDisplay = [string]$SqlServerDisplay
+$ReportServerName = ($SqlServerDisplay -replace '\\', '$')
+$ReportServerName = ($ReportServerName -replace '[<>:"/\|?*,]', '_')
+$DetailsPath    = Join-Path $ResultsFolder ("{0}_SQL_Security_Assessment_CommunityEdition_{1}.html" -f $ReportServerName, $TimeStamp)
 
 
 
 
+# --- USE EMBEDDED SQL SOURCE ---
+$SqlText = Remove-SkippedAssessmentSqlBatches -SqlText $EmbeddedAssessmentSql -SkipCheckIds $ActiveSkipChecks
 
+if ($AwsRdsCompat) {
+    $SqlText = $SqlText.Replace(
+        'DECLARE @SqlSafeExcludeModelDatabase bit = 0;',
+        'DECLARE @SqlSafeExcludeModelDatabase bit = 1;'
+    )
+    $SqlText = $SqlText.Replace(
+        'DECLARE @SqlSafeAwsRdsCompat bit = 0;',
+        'DECLARE @SqlSafeAwsRdsCompat bit = 1;'
+    )
+}
 
+if ($ActiveSkipChecks.Count -gt 0) {
+    $AllowedCheckIds = @($AllowedCheckIds | Where-Object { (Normalize-CheckId $_) -notin $ActiveSkipChecks })
+    $AllowedCheckIdLookup = @{}
+    foreach ($id in $AllowedCheckIds) { $AllowedCheckIdLookup[$id] = $true }
+}
 
+# --- RUN SQL ---
+Write-Log '--- Phase: SQL checks execution ---'
+try {
+    $Data = Invoke-AssessmentSqlClient -ServerInstance $SqlServer -Database $Database -SqlText $SqlText -AuthMethod $AuthMethod -Username $Username -Password $Password -EncryptOption $EncryptOption -TrustCert $TrustCert
+}
+catch {
+    $msg    = "Failed to execute embedded SQL against server '{0}': {1}" -f $SqlServer, $_.Exception.Message
+    $msgLog = $msg -replace "(?i)(Login failed for user\s+)'[^']*'", '$1[REDACTED]'
+    Write-Log $msg -AlwaysShow -FileMessage $msgLog
+    Set-SqlSafeExitCode 3
+    Write-AbortEntry
+    return
+}
 
+if ($null -eq $Data) {
+    $Data = @()
+}
 
+$AllRows = @($Data)
+Write-Log "SQL execution complete - $($AllRows.Count) total rows returned"
 
+$check010ServiceLoginExclusions = @(Get-SqlServiceLoginExclusions -SqlInstance $SqlServer)
+if ($check010ServiceLoginExclusions.Count -gt 0) {
+    $check010ExclusionLookup = @{}
+    foreach ($loginName in $check010ServiceLoginExclusions) {
+        if (-not [string]::IsNullOrWhiteSpace($loginName)) {
+            $check010ExclusionLookup[[string]$loginName] = $true
+        }
+    }
 
+    $rowCountBeforeServiceExclusions = $AllRows.Count
+    $AllRows = @(
+        $AllRows | Where-Object {
+            $checkId = Get-RowCheckId $_
+            if ($checkId -ne '010') { return $true }
+            if (-not $_.PSObject.Properties['LoginName']) { return $true }
 
+            $loginName = [string]$_.LoginName
+            return (-not $check010ExclusionLookup.ContainsKey($loginName))
+        }
+    )
 
+    $excludedServiceLoginRowCount = $rowCountBeforeServiceExclusions - $AllRows.Count
+    if ($excludedServiceLoginRowCount -gt 0) {
+        Write-Log ("Check 010 service-login exclusions removed {0} row(s): {1}" -f $excludedServiceLoginRowCount, ($check010ServiceLoginExclusions -join ', '))
+    }
+}
 
+$check026PermissionExclusions = @(Get-Check026PermissionExclusions)
+foreach ($loginName in $check010ServiceLoginExclusions) {
+    if (-not [string]::IsNullOrWhiteSpace($loginName)) {
+        $check026PermissionExclusions += [pscustomobject]@{
+            LoginName      = [string]$loginName
+            PermissionName = 'CONNECT SQL'
+        }
+    }
+}
 
+if ($check026PermissionExclusions.Count -gt 0) {
+    $check026ExclusionLookup = @{}
+    foreach ($exclusion in $check026PermissionExclusions) {
+        $loginName = [string]$exclusion.LoginName
+        $permissionName = [string]$exclusion.PermissionName
+        if (-not [string]::IsNullOrWhiteSpace($loginName) -and -not [string]::IsNullOrWhiteSpace($permissionName)) {
+            $check026ExclusionLookup[("{0}|{1}" -f $loginName, $permissionName)] = $true
+        }
+    }
+
+    $rowCountBeforeCheck026Exclusions = $AllRows.Count
+    $AllRows = @(
+        $AllRows | Where-Object {
+            $checkId = Get-RowCheckId $_
+            if ($checkId -ne '026') { return $true }
+            if ($_.PSObject.Properties['AdditionalInfo']) {
+                $additionalInfoText = [string]$_.AdditionalInfo
+                if ($additionalInfoText -match '(?i)<state_desc>\s*DENY\s*</state_desc>') {
+                    return $false
+                }
+            }
+            if (-not $_.PSObject.Properties['LoginName']) { return $true }
+            if (-not $_.PSObject.Properties['PermissionName']) { return $true }
+
+            $exclusionKey = "{0}|{1}" -f ([string]$_.LoginName), ([string]$_.PermissionName)
+            return (-not $check026ExclusionLookup.ContainsKey($exclusionKey))
+        }
+    )
+
+    $excludedCheck026RowCount = $rowCountBeforeCheck026Exclusions - $AllRows.Count
+    if ($excludedCheck026RowCount -gt 0) {
+        $excludedCheck026Labels = @($check026PermissionExclusions | ForEach-Object { "{0} / {1}" -f $_.LoginName, $_.PermissionName })
+        Write-Log ("Check 026 permission exclusions removed {0} row(s): {1}" -f $excludedCheck026RowCount, ($excludedCheck026Labels -join ', '))
+    }
+}
+if ($AwsRdsCompat) {
+    $rowCountBeforeCheck028Exclusions = $AllRows.Count
+    $AllRows = @(
+        $AllRows | Where-Object {
+            $checkId = Get-RowCheckId $_
+            if ($checkId -ne '028') { return $true }
+            if (-not $_.PSObject.Properties['DatabaseName']) { return $true }
+
+            return ([string]$_.DatabaseName -ne 'rdsadmin')
+        }
+    )
+
+    $excludedCheck028RowCount = $rowCountBeforeCheck028Exclusions - $AllRows.Count
+    if ($excludedCheck028RowCount -gt 0) {
+        Write-Log ("Check 028 AWS RDS compatibility exclusions removed {0} row(s): rdsadmin" -f $excludedCheck028RowCount)
+    }
+}
+$RowsWithoutCheckId = @($AllRows | Where-Object { [string]::IsNullOrWhiteSpace((Get-RowCheckId $_)) })
+$RowsWithCheckId = @($AllRows | Where-Object { $id = Get-RowCheckId $_; -not [string]::IsNullOrWhiteSpace($id) -and $AllowedCheckIdLookup.ContainsKey($id) })
+
+$CatalogLookup = @{}
+foreach ($catalogRow in $Catalog) {
+    $normalizedId = Normalize-CheckId $catalogRow.'Check ID'
+    if ($null -eq $normalizedId) { continue }
+    if (-not $CatalogLookup.ContainsKey($normalizedId)) {
+        $CatalogLookup[$normalizedId] = $catalogRow
+    }
+}
+
+Write-Log '--- Phase: Check outcome evaluation ---'
+
+try {
+    Write-Log "Rows with Check ID : $($RowsWithCheckId.Count)  |  Rows without Check ID: $($RowsWithoutCheckId.Count)"
+
+    $SqlServerMajorVersion = Get-SqlServerMajorVersionFromRows -Rows $RowsWithCheckId
+    if ($null -ne $SqlServerMajorVersion) {
+        Write-LogValue 'SQL major version' $SqlServerMajorVersion
+    }
+    else {
+        Write-Log 'SQL major version could not be determined from check 800.'
+    }
+
+    $RowsByCheckId = @{}
+    foreach ($row in $RowsWithCheckId) {
+        $checkId = Get-RowCheckId $row
+        if ([string]::IsNullOrWhiteSpace($checkId)) { continue }
+
+        if (-not $RowsByCheckId.ContainsKey($checkId)) {
+            $RowsByCheckId[$checkId] = New-Object System.Collections.Generic.List[object]
+        }
+
+        $RowsByCheckId[$checkId].Add($row) | Out-Null
+    }
+
+    $IsAwsRdsInstance = Test-AwsRdsInstanceFromRows -Rows $RowsWithCheckId
+    Write-LogValue 'AWS RDS detected' ([bool]$IsAwsRdsInstance)
+
+    $AwsManagedCheckIds = @(
+        '028','031','034','036','038',
+        '050', '072','078','155',
+        '008','079','010','069'
+    )
+    $AwsManagedCheckIdLookup = @{}
+    foreach ($awsManagedCheckId in $AwsManagedCheckIds) {
+        $normalizedAwsManagedCheckId = Normalize-CheckId $awsManagedCheckId
+        if (-not [string]::IsNullOrWhiteSpace($normalizedAwsManagedCheckId)) {
+            $AwsManagedCheckIdLookup[$normalizedAwsManagedCheckId] = $true
+        }
+    }
+
+    $ProcessedData = @()
+
+    foreach ($allowedCheckId in $AllowedCheckIds) {
+        $checkId = Normalize-CheckId $allowedCheckId
+        if ([string]::IsNullOrWhiteSpace($checkId)) { continue }
+
+        $rows = @(Get-RowsFromCheckBucket -RowsByCheckId $RowsByCheckId -CheckId $checkId)
+
+        $section = 'Unmapped'
+        $sectionId = 999
+
+        if ($CatalogLookup.ContainsKey($checkId)) {
+            $catalogRow = $CatalogLookup[$checkId]
+            $section = [string]$catalogRow.Section
+            $sectionIdValue = 999
+            if ([int]::TryParse([string]$catalogRow.SectionID, [ref]$sectionIdValue)) {
+                $sectionId = $sectionIdValue
+            }
+        }
+
+        if (-not $RecommendationLookup.ContainsKey($checkId) -or [string]::IsNullOrWhiteSpace([string]$RecommendationLookup[$checkId].CheckName)) {
+            throw "Missing CheckName in RecommendationLookup for check $checkId."
+        }
+
+        $checkName = [string]$RecommendationLookup[$checkId].CheckName
+
+        $applicability = Get-CheckApplicability -CheckId $checkId -SqlServerMajorVersion $SqlServerMajorVersion
+
+        if (-not $applicability.IsApplicable) {
+            $rows = @([pscustomobject]@{
+                Result = [string]$applicability.Message
+            })
+            $outcome = 'INFO'
+        }
+        else {
+            $outcome = Get-CheckOutcome -CheckId $checkId -Rows $rows -RecommendationLookup $RecommendationLookup
+        }
+
+        $ProcessedData += [PSCustomObject]@{
+            CheckId   = $checkId
+            CheckName = $checkName
+            Outcome   = $outcome
+            Section   = $section
+            SectionID = $sectionId
+            Rows      = $rows
+            IsAwsManaged = ($IsAwsRdsInstance -and $AwsManagedCheckIdLookup.ContainsKey($checkId))
+        }
+    }
+
+    $ProcessedData = @(
+        $ProcessedData |
+        Sort-Object SectionID,
+            @{
+                Expression = {
+                    if ([int]$_.SectionID -eq 0) {
+                        return ('{0:D6}' -f [int]$_.CheckId)
+                    }
+
+                    return ([string]$_.CheckName).ToUpperInvariant()
+                }
+            },
+            @{ Expression = { [int]([string]$_.CheckId -as [int]) } },
+            CheckId
+    )
+
+    Write-LogValue 'Processed checks' (@($ProcessedData).Count)
+}
+catch {
+    $msg = "Outcome evaluation failed: {0}" -f $_.Exception.Message
+    Write-Log $msg -AlwaysShow
+    Set-SqlSafeExitCode 2
+    Write-AbortEntry
+    return
+}
+
+# --- SUMMARY COUNTS / DETAILS REPORT ---
+Write-Log '--- Phase: Report generation ---'
+$TotalChecks = @(Get-ExecutiveData -Items $ProcessedData).Count
+$Fails  = @($ProcessedData | Where-Object { $_.Outcome -eq 'FAIL' }).Count
+$Warns  = @($ProcessedData | Where-Object { $_.Outcome -eq 'WARNING' }).Count
+$Passes = @($ProcessedData | Where-Object { $_.Outcome -eq 'PASS' }).Count
+$Observes = @($ProcessedData | Where-Object { $_.Outcome -eq 'OBSERVE' }).Count
+$ReportDateDisplay = Protect-HeaderValue (Get-Date -Format 'yyyy-MM-dd HH:mm')
+$ScopeDisplay = Protect-HeaderValue ([string]$SqlServerDisplay)
+$DetailSectionCount = @(
+    $ProcessedData |
+    Where-Object { $_.SectionID -ne 999 -and -not [string]::IsNullOrWhiteSpace($_.Section) } |
+    Group-Object Section |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) }
+).Count
+
+$DetailSectionsGrouped = @(
+    $ProcessedData |
+    Group-Object Section |
+    Sort-Object { [int]($_.Group[0].SectionID) }, Name
+)
+
+$CategorySummaryRows = @()
+foreach ($sectionGroup in $DetailSectionsGrouped) {
+    $sectionName = [string]$sectionGroup.Name
+    $items = @($sectionGroup.Group)
+    $safeSectionName = [System.Net.WebUtility]::HtmlEncode($sectionName)
+    $passCount = @($items | Where-Object { $_.Outcome -eq 'PASS' }).Count
+    $observeCount = @($items | Where-Object { $_.Outcome -eq 'OBSERVE' }).Count
+    $warningCount = @($items | Where-Object { $_.Outcome -eq 'WARNING' }).Count
+    $failCount = @($items | Where-Object { $_.Outcome -eq 'FAIL' }).Count
+    $infoCount = @($items | Where-Object { $_.Outcome -eq 'INFO' }).Count
+
+    $totalCount = $items.Count
+    $defaultCountClass = 'category-summary-count outcome-zero'
+    $failCountClass = if ($failCount -gt 0) { 'category-summary-count status-FAIL' } else { 'category-summary-count outcome-zero' }
+    $passDisplay = [string]$passCount
+    $observeDisplay = [string]$observeCount
+    $warningDisplay = [string]$warningCount
+    $failDisplay = [string]$failCount
+
+    if ($sectionName -eq 'Information') {
+        $passDisplay = '-'
+        $observeDisplay = '-'
+        $warningDisplay = '-'
+        $failDisplay = '-'
+        $failCountClass = $defaultCountClass
+    }
+
+    $CategorySummaryRows += @"
+        <tr>
+            <td>$safeSectionName</td>
+            <td><span class='$defaultCountClass'>$infoCount</span></td>
+            <td><span class='$defaultCountClass'>$passDisplay</span></td>
+            <td><span class='$defaultCountClass'>$observeDisplay</span></td>
+            <td><span class='$defaultCountClass'>$warningDisplay</span></td>
+            <td><span class='$failCountClass'>$failDisplay</span></td>
+            <td><span class='$defaultCountClass indicator-count'>$totalCount</span></td>
+        </tr>
+"@
+}
+
+$CategorySummaryBodyHtml = $CategorySummaryRows -join "`r`n"
+$CategorySummaryHtml = @"
+<section class='category-summary-panel' aria-label='Checks and status counts by category'>
+    <div class='category-summary-title'>Checks and Status by Category</div>
+    <div class='category-summary-table-wrap'>
+        <table class='category-summary-table'>
+            <thead>
+                <tr>
+                    <th>Category</th>
+                    <th>INFO</th>
+                    <th>PASS</th>
+                    <th>OBSERVE</th>
+                    <th>WARNING</th>
+                    <th>FAIL</th>
+                    <th>Indicators</th>
+                </tr>
+            </thead>
+            <tbody>
+$CategorySummaryBodyHtml
+            </tbody>
+        </table>
+    </div>
+    <div class='outcome-definitions'>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-INFO'>INFO</span><span>Context only. Not a security finding.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-PASS'>PASS</span><span>The assessed condition met the expected rule.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-OBSERVE'>OBSERVE</span><span>Review or monitor. Impact depends on environment.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-WARNING'>WARNING</span><span>Security-relevant finding. Review and likely remediate.</span></div>
+        <div class='outcome-definition'><span class='outcome-definition-label outcome-FAIL'>FAIL</span><span>Clear security risk. Prompt attention required.</span></div>
+    </div>
+</section>
+"@
+
+$DetailBlocks = @()
+
+foreach ($sectionGroup in $DetailSectionsGrouped) {
+    $sectionName = [string]$sectionGroup.Name
+    $sectionId = [string]$sectionGroup.Group[0].SectionID
+    $safeSectionName = [System.Net.WebUtility]::HtmlEncode($sectionName)
+    $safeSectionAnchor = 'detail-section-' + $sectionId
+    $DetailBlocks += "<h2 class='section-heading' id='$safeSectionAnchor'>$safeSectionName</h2>"
+
+    foreach ($item in $sectionGroup.Group) {
+        $safeCheckId = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckId)
+        $safeCheckName = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckName)
+        $managedLabelHtml = ''
+        if ($item.PSObject.Properties['IsAwsManaged'] -and [bool]$item.IsAwsManaged) {
+            $managedLabelHtml = '<span class="managed-label managed-label-aws"><span class="managed-label-dot"></span>AWS managed</span>'
+        }
+        $outcome = [string]$item.Outcome
+        $outcomeBadge = Get-OutcomeBadgeHtml -Outcome $outcome
+        $detailTable = Convert-DataRowsToHtmlTable -Rows $item.Rows
+        $recommendationPanel = Get-RecommendationPanelHtml -Outcome $outcome -CheckId $item.CheckId -RecommendationLookup $RecommendationLookup -DetailRowCount @($item.Rows).Count
+
+        if ($outcome -eq 'PASS') {
+            $DetailBlocks += @"
+<section class='detail-section detail-section-static' data-check-id='$safeCheckId' data-outcome='$outcome'>
+    <table class='compact-summary-table'>
+        <tr>
+            <td class='summary-check-id'>($safeCheckId)</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
+            <td class='summary-check-outcome'>$outcomeBadge</td>
+        </tr>
+    </table>
+</section>
+"@
+            continue
+        }
+
+        $DetailBlocks += @"
+<section class='detail-section' data-check-id='$safeCheckId' data-outcome='$outcome'>
+    <table class='compact-summary-table'>
+        <tr>
+            <td class='summary-check-id'>($safeCheckId)</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
+            <td class='summary-check-outcome'>$outcomeBadge</td>
+        </tr>
+    </table>
+    <div class='detail-content'>
+        $detailTable
+        $recommendationPanel
+    </div>
+</section>
+"@
+    }
+}
+
+$DetailsHeaderHtml = ''
+$DetailsNavigationHtml = ''
+$DetailsBodyHtml = @($CategorySummaryHtml, ($DetailBlocks -join "`r`n")) -join "`r`n"
+
+$DetailsTemplateHtml = $EmbeddedDetailsTemplateHtml
+
+$DetailsHtml = $DetailsTemplateHtml.Replace('<!--DETAIL_HEADER-->', $DetailsHeaderHtml)
+$DetailsHtml = $DetailsHtml.Replace('<!--DETAIL_NAVIGATION-->', $DetailsNavigationHtml)
+$DetailsHtml = $DetailsHtml.Replace('<!--DETAIL_BODY-->', $DetailsBodyHtml)
+$DetailsHtml = $DetailsHtml.Replace('{RELEASE_VERSION}', [string]$ReleaseVersion)
+$DetailsHtml = $DetailsHtml.Replace('{CHECK_COUNT}', [string]$TotalChecks)
+$DetailsHtml = $DetailsHtml.Replace('{SECTION_COUNT}', [string]$DetailSectionCount)
+$DetailsHtml = $DetailsHtml.Replace('{REPORT_DATE}', [string]$ReportDateDisplay)
+$DetailsHtml = $DetailsHtml.Replace('{TARGET_SERVER}', [string]$ScopeDisplay)
+$utf8WithBom = New-Object System.Text.UTF8Encoding($true)
+Write-Log "Writing HTML report to: $DetailsPath"
+[System.IO.File]::WriteAllText($DetailsPath, $DetailsHtml, $utf8WithBom)
+Write-Log "Report written successfully ($([Math]::Round((Get-Item $DetailsPath).Length / 1KB, 1)) KB)"
+
+Write-Log ("Success! Assessment report created at: {0}" -f $DetailsPath) -Color Green -AlwaysShow
+
+if (-not $NoAutoOpenReport) {
+    Write-Log '--- Phase: Launching report ---'
+    try {
+        Start-Process -FilePath $DetailsPath -ErrorAction Stop
+        Write-Log "Report opened in default browser"
+    }
+    catch {
+        Write-Log ("Report launch failed: {0}" -f $_.Exception.Message)
+        Write-Host "Report launch was blocked (endpoint security product or shell restriction)." -ForegroundColor Yellow
+        Write-Host ("Open manually: {0}" -f $DetailsPath) -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Log "Report launch skipped (-NoAutoOpenReport)"
+}
+
+Write-LogValue 'Report file' $DetailsPath
+if ($script:WriteLogEnabled -and -not [string]::IsNullOrWhiteSpace($script:LogPath)) {
+    Write-Log ("{0,-17}: {1}" -f 'Log file', $script:LogPath) -Color Cyan
+}
+Write-Log "Assessment completed successfully."
+Write-Log '=== Assessment complete ==='
