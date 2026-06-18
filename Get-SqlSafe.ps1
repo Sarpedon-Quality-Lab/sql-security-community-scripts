@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     SQL Server Security Assessment Collector - Community Edition
 
