@@ -37,6 +37,8 @@ Version 2026.5 builds on 2026.4 and adds:
 
 - Individual database-level reports through `-CreateIndividualDBLevelReports` and the GUI checkbox. Each report covers the database-scoped checks for one database and is written to a `<ServerName>__<Timestamp>__DatabaseLevelReports` sub-folder next to the main report, which also links to that folder.
 - New included Check `130` - `Db_owner database role members`, which reports members of the `db_owner` database role across all online databases.
+  
+<img width="554" height="415" alt="V5LogonDialogueWithPerDatabaseReportOption" src="https://github.com/user-attachments/assets/b8fa7df4-c890-4715-a5aa-d53e9f80f014" />
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
 
