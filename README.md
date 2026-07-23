@@ -1,7 +1,7 @@
 # Get-SqlSafe.ps1: The Sarpedon SQL Server Security Community Assessment
 
 **Logic & Engine by Andreas Wolter (MCSM)**  
-Version 2026.4
+Version 2026.5
 
 Get-SqlSafe Community Edition is a standalone PowerShell-based SQL Server security assessment collector. It gathers selected high-level security indicators from a SQL Server instance and generates a local HTML report for review and remediation discussions.
 
@@ -28,6 +28,17 @@ This Community Edition is designed to:
 - Support selected checks against SQL Server on Amazon RDS through an explicit compatibility mode.
 
 <img width="1287" height="1092" alt="Get-SqlSafe Community Edition security assessment report" src="https://github.com/user-attachments/assets/a645177a-a70b-45b7-8c81-7d6a8e0a5524" />
+
+---
+
+## What Changed in 2026.5
+
+Version 2026.5 builds on 2026.4 and adds:
+
+- Individual database-level reports through `-CreateIndividualDBLevelReports` and the GUI checkbox. Each report covers the database-scoped checks for one database and is written to a `<ServerName>__<Timestamp>__DatabaseLevelReports` sub-folder next to the main report, which also links to that folder.
+- New included Check `130` - `Db_owner database role members`, which reports members of the `db_owner` database role across all online databases.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
 
 ---
 
@@ -63,6 +74,7 @@ Generated reports and logs are written to:
 
 ```text
 .\Results
+.\Results\<ServerName>__<Timestamp>__DatabaseLevelReports   (only with -CreateIndividualDBLevelReports)
 ```
 
 The public package does not require a separate SQL file.
@@ -115,8 +127,9 @@ Contained availability group metadata is available only when the target SQL Serv
 6. Select Windows or SQL authentication.
 7. Choose the encryption options required by the target.
 8. Enable AWS RDS compatibility mode when assessing SQL Server on Amazon RDS.
-9. Optionally test the connection and permissions.
-10. Start the assessment.
+9. Optionally enable additional per-database reports.
+10. Optionally test the connection and permissions.
+11. Start the assessment.
 
 The generated HTML report is written to the `Results` subfolder and opens automatically unless report launch is disabled.
 
@@ -187,12 +200,31 @@ Console mode and `-NoAutoOpenReport` are useful for controlled endpoints, automa
 | `-SqlUser` | SQL login name. Required when `-Auth SQL` is used. |
 | `-SqlPass` | SQL login password as a `SecureString`. If omitted for SQL authentication, the script prompts interactively. |
 | `-Encrypt` | Connection encryption mode: `Optional` or `Mandatory`. Defaults to `Optional`. |
-| `-TrustServerCert` | Trusts the SQL Server certificate without certificate-chain validation. |
+| `-TrustServerCert` | Trusts the SQL Server certificate without certificate-chain validation. Only takes effect together with `-Encrypt Mandatory`; see [Connection Encryption](#connection-encryption). |
+| `-CreateIndividualDBLevelReports` | Additionally writes one report per database into a sub-folder next to the main report. |
 | `-AwsRdsCompat` | Enables AWS RDS compatibility behavior and `AWS managed` labels. |
 | `-WindowsCredential` | Relaunches the assessment under another Windows account. Valid with Windows authentication and requires `-SqlInstance`. |
 | `-WriteLog` | Writes run output to a log file in the `Results` folder. Alias: `-LogFile`. |
 | `-Verbose` | Shows verbose progress output in the console independently of `-WriteLog`. |
 | `-NoAutoOpenReport` | Prevents the generated HTML report from opening automatically. |
+
+---
+
+## Connection Encryption
+
+`-Encrypt` and `-TrustServerCert` work together, and the second only means something in combination with the first:
+
+| Encryption | Trust certificate | Result |
+| --- | --- | --- |
+| `Optional` (default) | off or on | No practical difference. The certificate is not validated either way. |
+| `Mandatory` | off | The session is encrypted and the certificate is validated: the chain must be trusted, the certificate unexpired, and its name must match the server name as typed. A stock instance using its auto-generated self-signed certificate will fail this. |
+| `Mandatory` | on | The session is encrypted, but any certificate is accepted. This protects against passive interception, not against an active man-in-the-middle. |
+
+The login packet, including the password when `-Auth SQL` is used, is encrypted during the TDS pre-login handshake regardless of these settings. `Optional` means the rest of the session — the queries and all result rows — is unencrypted and no certificate is verified.
+
+One exception to the first row: if the instance has `ForceEncryption` enabled, the server imposes encryption even when `Optional` was requested, and certificate validation then applies. That is the usual reason an `Optional` connection unexpectedly fails on certificate trust.
+
+For an assessment run across an untrusted network, prefer `-Encrypt Mandatory` with a properly issued certificate and without `-TrustServerCert`.
 
 ---
 
@@ -298,7 +330,9 @@ ALTER SERVER ROLE sysadmin ADD MEMBER SqlAssessmentReader;
 
 SQL Server 2012 has fewer granular metadata visibility options. Review this requirement carefully before running the Community Edition against SQL Server 2012 systems.
 
-The script includes a connection and permission test in the GUI. In console mode, missing permissions are typically discovered during SQL execution.
+`CONNECT ANY DATABASE` is required for the checks that enumerate database-scoped information across all databases, including Check `130`.
+
+The script includes a connection and permission test in the GUI. The test checks the permission set that applies to the detected SQL Server version. In console mode, missing permissions are typically discovered during SQL execution.
 
 ---
 
@@ -313,6 +347,7 @@ The assessment covers high-level indicators across areas such as:
 - `TRUSTWORTHY` and cross-database ownership chaining
 - Powerful features such as `xp_cmdshell`, ad hoc distributed queries, and OLE Automation
 - Orphaned Windows logins and database users
+- `db_owner` database role membership
 - SQL Server security audit configuration
 - Database ownership risks
 - SQL Server error log retention
@@ -321,13 +356,16 @@ The assessment covers high-level indicators across areas such as:
 
 The HTML report includes:
 
-- Execution metadata and target summary
+- Execution metadata and target summary, with separate control and informational item counts
 - Outcome distribution chart
+- Outcome filters showing the number of results per outcome
 - Category summary table with status counts and total indicators
 - Outcome definition legend
 - Detailed findings grouped by category
 - Recommendations and references for actionable findings
 - Informational context for version and system overview checks
+
+When per-database reports are requested, each database additionally receives its own report containing the database-scoped checks for that database, with a compact outcome summary in place of the distribution chart.
 
 ---
 
@@ -351,6 +389,8 @@ For `OBSERVE`, `WARNING`, and `FAIL` findings, the report includes recommendatio
 
 The tool generates a local HTML report in the `Results` folder. The report filename includes the target server and timestamp. When `-WriteLog` is used, a `.log` file is also written to the same folder.
 
+With `-CreateIndividualDBLevelReports`, the per-database reports are written to a `<ServerName>__<Timestamp>__DatabaseLevelReports` sub-folder inside `Results`, and the main report links to that folder. These reports contain the same findings as the main report, scoped to a single database.
+
 Generated reports and logs may include sensitive environment-specific information, including:
 
 - Server and database names
@@ -373,6 +413,8 @@ The embedded SQL assessment text is validated before execution using SHA-256.
 The required hash is stored in the script and compared against the embedded SQL text before execution. If the embedded SQL text does not match the required hash, execution stops.
 
 This helps detect accidental edits, copy/paste damage, or mismatched build artifacts. For enterprise tamper protection, use your normal file-hash validation and code-signing process.
+
+The required hash changes whenever the embedded SQL text changes, including its version banner, so it differs between releases.
 
 ---
 
@@ -452,6 +494,15 @@ The Community Edition is intentionally limited. It is not:
 A clean report means that the covered baseline indicators did not identify findings. SQL Server's real attack surface is broader and depends on combinations of permissions, ownership, impersonation, SQL Agent, linked servers, database configuration, service accounts, backups, operating-system security posture, and platform-specific controls.
 
 Some checks may require permissions that are not available on older SQL Server versions or managed platforms without elevated access. Use the report as a starting point for deeper review and remediation planning.
+
+---
+
+## Upgrade Notes from 2026.4
+
+- Replace the previous collector with the new `Get-SqlSafe.ps1` file.
+- Grant `CONNECT ANY DATABASE` to the assessment login if it does not have it. Check `130` needs it to enumerate `db_owner` membership across databases.
+- Reports generated by 2026.4 remain readable. The report layout changes apply to newly generated reports only.
+- Enable `-CreateIndividualDBLevelReports` only when per-database reports are wanted; the option adds one HTML file per database.
 
 ---
 

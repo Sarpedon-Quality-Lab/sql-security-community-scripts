@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     SQL Server Security Assessment Collector - Community Edition
 
@@ -31,7 +31,14 @@
     Connection encryption: Optional (default) or Mandatory.
 
 .PARAMETER TrustServerCert
-    Trusts the server certificate without validation.
+    Trusts the server certificate without certificate-chain validation.
+    Only has an effect together with -Encrypt Mandatory: with -Encrypt Optional (the default)
+    the certificate is not validated in the first place, so this switch changes nothing. The
+    exception is an instance with ForceEncryption enabled, where the server imposes encryption
+    and validation applies even when Optional was requested.
+    With -Encrypt Mandatory the connection is encrypted either way, but trusting the certificate
+    means any certificate is accepted, which leaves the session open to a man-in-the-middle.
+    Prefer a properly issued certificate and omit this switch where possible.
 
 .PARAMETER SkipChecks
     Check IDs to skip. Use this for checks that are incompatible with restricted platforms.
@@ -42,12 +49,12 @@
     from database-owner checks, excludes AWS RDS-managed rows such as rdsadmin where applicable,
     and skips check 046 by design, independently of -SkipChecks.
 
+.PARAMETER CreateIndividualDBLevelReports
+    Creates additional database-level HTML reports for databases that have database-scoped findings.
+
 .PARAMETER WindowsCredential
     Relaunches the assessment under an alternate Windows account via Start-Process -Credential.
     Requires -SqlInstance. Only valid with -Auth Windows (default).
-
-.PARAMETER Verbose
-    Shows progress and operational messages in the console.
 
 .PARAMETER WriteLog
     Writes diagnostic output to a .log file alongside the HTML report.
@@ -55,7 +62,7 @@
     -Verbose controls console output; -WriteLog controls file output.
 
 .NOTES
-    Version:  2026.4
+    Version:  2026.5
     Author:   Andreas Wolter (Sarpedon Quality Lab)
     License:  Sarpedon Community License
     Website:  https://www.SarpedonQualityLab.US/resources
@@ -112,9 +119,9 @@
 #>
 
 
+[CmdletBinding()]
 param(
     [switch]$NoAutoOpenReport,
-    [switch]$Verbose,
     [Alias('NoUI','NonInteractive')]
     [switch]$ConsoleOnly,
     [string]$SqlInstance,
@@ -127,6 +134,7 @@ param(
     [switch]$TrustServerCert,
     [string[]]$SkipChecks = @(),
     [switch]$AwsRdsCompat,
+    [switch]$CreateIndividualDBLevelReports,
     [System.Management.Automation.PSCredential]$WindowsCredential,
     [Alias('LogFile')]
     [switch]$WriteLog
@@ -142,6 +150,7 @@ $script:LogPath                    = $null
 $script:LogBuffer                  = New-Object System.Collections.Generic.List[string]
 $script:SkipChecks                 = @($SkipChecks)
 $script:AwsRdsCompat               = [bool]$AwsRdsCompat
+$script:CreateIndividualDBLevelReports = [bool]$CreateIndividualDBLevelReports
 $script:SecurityAdminRequiredCheckIds = @('046')
 $script:WindowsCredentialSpecified = $PSBoundParameters.ContainsKey('WindowsCredential')
 if (-not [string]::IsNullOrWhiteSpace($SqlInstance) -or $script:WindowsCredentialSpecified) { $ConsoleOnly = $true }
@@ -262,8 +271,8 @@ function Stop-SqlSafeRun {
 
 # --- CONFIGURATION ---
 $ScriptRoot    = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ReleaseVersion = '2026.4'
-$RequiredSql = 'b87feb6e932f3009a1c2f13d2fba9750c956d9cdd082e36c97eed5e3a923c927'
+$ReleaseVersion = '2026.5'
+$RequiredSql = '1fee4b8a3a6d02fbe49a559b2a21f10d9a1fa1a8cecc2b73bb88ca875b3c2b03'
 $ResultsFolder = Join-Path $ScriptRoot 'Results'
 if (-not (Test-Path $ResultsFolder)) { New-Item -ItemType Directory -Path $ResultsFolder | Out-Null }
 
@@ -323,8 +332,9 @@ if ($script:WindowsCredentialSpecified) {
         $childCommandParts.Add((ConvertTo-PSQuotedString ($SkipChecks -join ',')))
     }
     if ($AwsRdsCompat) { $childCommandParts.Add('-AwsRdsCompat') }
+    if ($CreateIndividualDBLevelReports) { $childCommandParts.Add('-CreateIndividualDBLevelReports') }
     if ($NoAutoOpenReport) { $childCommandParts.Add('-NoAutoOpenReport') }
-    if ($script:VerboseEnabled) { $childCommandParts.Add('-Verbose') }
+    if ($VerbosePreference -eq 'Continue') { $childCommandParts.Add('-Verbose') }
     if ($WriteLog) { $childCommandParts.Add('-WriteLog') }
 
     $childCommand   = $childCommandParts -join ' '
@@ -376,6 +386,7 @@ $Password                  = [System.Security.SecureString]::new()
 $EncryptOption             = 'Optional'
 $TrustCert                 = $false
 $ActiveSkipChecks          = @($SkipChecks)
+$CreateIndividualReports   = [bool]$CreateIndividualDBLevelReports
 
 $SqlServer                 = $null
 $Database                  = 'master'
@@ -422,7 +433,7 @@ function Show-UiMessage {
 }
 
 function Get-DialogInput {
-    param($ServerInput, $AuthDropdown, $UsernameInput, $PasswordInput, $EncryptOption, $TrustCert, $SkipSecurityAdminChecks, $AwsRdsCompatChecks)
+    param($ServerInput, $AuthDropdown, $UsernameInput, $PasswordInput, $EncryptOption, $TrustCert, $SkipSecurityAdminChecks, $AwsRdsCompatChecks, $CreateIndividualDBLevelReportsCheck)
 
     $dialogSkipChecks = New-Object System.Collections.Generic.List[string]
     if ($SkipSecurityAdminChecks -and [bool]$SkipSecurityAdminChecks.IsChecked) {
@@ -440,6 +451,7 @@ function Get-DialogInput {
         TrustCert     = [bool]$TrustCert.IsChecked
         SkipChecks    = [string[]]$dialogSkipChecks.ToArray()
         AwsRdsCompat  = ($AwsRdsCompatChecks -and [bool]$AwsRdsCompatChecks.IsChecked)
+        CreateIndividualDBLevelReports = ($CreateIndividualDBLevelReportsCheck -and [bool]$CreateIndividualDBLevelReportsCheck.IsChecked)
     }
 }
 
@@ -609,7 +621,7 @@ SELECT
 
         $metadataReader.Close()
 
-        if ($majorVersion -ge 12) {
+        if ($majorVersion -ge 16) {
             if ($InputObject.PSObject.Properties['AwsRdsCompat'] -and [bool]$InputObject.AwsRdsCompat) {
                 $permissionSql = @"
 SELECT
@@ -650,6 +662,50 @@ FROM (VALUES
     (N'VIEW SERVER SECURITY STATE'),
     (N'VIEW ANY SECURITY DEFINITION'),
     (N'VIEW SERVER PERFORMANCE STATE'),
+    (N'CONNECT ANY DATABASE')
+) v(permission_name);
+"@
+            }
+        }
+        elseif ($majorVersion -ge 12) {
+            if ($InputObject.PSObject.Properties['AwsRdsCompat'] -and [bool]$InputObject.AwsRdsCompat) {
+                $permissionSql = @"
+SELECT
+    v.permission_name AS role_or_permission,
+    CASE HAS_PERMS_BY_NAME(NULL, NULL, v.permission_name)
+        WHEN 1 THEN N'Yes'
+        WHEN 0 THEN N'No'
+        ELSE N'UNKNOWN'
+    END AS check_status
+FROM (VALUES
+    (N'VIEW SERVER STATE'),
+    (N'VIEW ANY DEFINITION')
+) v(permission_name);
+"@
+            }
+            else {
+                $permissionSql = @"
+SELECT
+    N'securityadmin OR sysadmin' AS role_or_permission,
+    CASE
+        WHEN IS_SRVROLEMEMBER(N'sysadmin') = 1
+          OR IS_SRVROLEMEMBER(N'securityadmin') = 1
+        THEN N'Yes'
+        ELSE N'No'
+    END AS check_status
+
+UNION ALL
+
+SELECT
+    v.permission_name AS role_or_permission,
+    CASE HAS_PERMS_BY_NAME(NULL, NULL, v.permission_name)
+        WHEN 1 THEN N'Yes'
+        WHEN 0 THEN N'No'
+        ELSE N'UNKNOWN'
+    END AS check_status
+FROM (VALUES
+    (N'VIEW SERVER STATE'),
+    (N'VIEW ANY DEFINITION'),
     (N'CONNECT ANY DATABASE')
 ) v(permission_name);
 "@
@@ -1582,6 +1638,54 @@ function Test-AwsRdsInstanceFromRows {
     return $false
 }
 
+function Get-RowDatabaseName {
+    param([AllowNull()][object]$Row)
+
+    if ($null -eq $Row) { return '' }
+
+    if ($Row.PSObject.Properties['DatabaseName']) {
+        $databaseName = ([string]$Row.DatabaseName).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($databaseName)) {
+            return $databaseName
+        }
+    }
+
+    if (-not $Row.PSObject.Properties['AdditionalInfo']) { return '' }
+    if ($null -eq $Row.AdditionalInfo -or $Row.AdditionalInfo -is [DBNull]) { return '' }
+
+    try {
+        if ($Row.AdditionalInfo -is [System.Xml.XmlNode]) {
+            $databaseNode = $Row.AdditionalInfo.SelectSingleNode('/AdditionalInfo/DatabaseName')
+            if ($null -ne $databaseNode -and -not [string]::IsNullOrWhiteSpace($databaseNode.InnerText)) {
+                return $databaseNode.InnerText.Trim()
+            }
+        }
+
+        $additionalInfoText = [string]$Row.AdditionalInfo
+        if ([string]::IsNullOrWhiteSpace($additionalInfoText)) { return '' }
+
+        $additionalInfoXml = [xml]$additionalInfoText
+        $databaseNode = $additionalInfoXml.SelectSingleNode('/AdditionalInfo/DatabaseName')
+        if ($null -ne $databaseNode -and -not [string]::IsNullOrWhiteSpace($databaseNode.InnerText)) {
+            return $databaseNode.InnerText.Trim()
+        }
+    }
+    catch {
+        return ''
+    }
+
+    return ''
+}
+
+function ConvertTo-SafeReportFilePart {
+    param([AllowNull()][string]$Value)
+
+    $safeValue = if ([string]::IsNullOrWhiteSpace($Value)) { 'Unknown' } else { $Value }
+    $safeValue = $safeValue -replace '\\', '$'
+    $safeValue = $safeValue -replace '[<>:"/\|?*,]', '_'
+    return $safeValue
+}
+
 function Get-CheckApplicability {
     param(
         [Parameter(Mandatory = $true)]
@@ -1753,7 +1857,7 @@ $EmbeddedAssessmentSql = @'
 /******************************************************************************
 * SQL Server Security Assessment - Community Edition
 * Logic & Engine by Andreas Wolter (MCSM)
-* Version:    2026.4
+* Version:    2026.5
 * Scope:      High-Level Security Indicators
 * License:    Sarpedon Community License (See LICENSE.md)
 * Resources:  https://www.SarpedonQualityLab.US/resources
@@ -2561,6 +2665,86 @@ SELECT * FROM @Check113;
 
 GO
 
+DECLARE @Check130 TABLE
+(
+      [Check ID]      varchar(10)
+    , DatabaseName    sysname
+    , MemberName      sysname
+    , Principal_Type  nvarchar(60)
+    , AdditionalInfo  xml
+);
+
+DECLARE @DatabaseName130 sysname;
+DECLARE @DatabaseStateDesc130 nvarchar(60);
+DECLARE @Sql130 nvarchar(max);
+
+DECLARE db_cursor_130 CURSOR LOCAL FAST_FORWARD FOR
+SELECT
+    databases.name,
+    databases.state_desc
+FROM sys.databases AS databases
+LEFT JOIN sys.dm_hadr_database_replica_states AS dm_hadr_database_replica_states
+    ON dm_hadr_database_replica_states.database_id = databases.database_id
+   AND dm_hadr_database_replica_states.is_local = 1
+WHERE databases.database_id > 4
+  AND databases.state_desc = N'ONLINE'
+  AND
+  (
+        dm_hadr_database_replica_states.database_id IS NULL
+        OR dm_hadr_database_replica_states.is_primary_replica = 1
+  )
+ORDER BY
+    databases.name;
+
+OPEN db_cursor_130;
+FETCH NEXT FROM db_cursor_130 INTO @DatabaseName130, @DatabaseStateDesc130;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @Sql130 = N'
+    SELECT
+          ''130'' AS [Check ID]
+        , ' + QUOTENAME(@DatabaseName130, '''') + N' AS DatabaseName
+        , member.name AS MemberName
+        , member.type_desc AS Principal_Type
+        , (
+            SELECT
+                  member.principal_id
+                , member.authentication_type_desc AS AuthType
+                , member.create_date
+                , member.modify_date
+            FOR XML PATH(''AdditionalInfo''), TYPE
+          ) AS AdditionalInfo
+    FROM ' + QUOTENAME(@DatabaseName130) + N'.sys.database_role_members AS database_role_members
+    INNER JOIN ' + QUOTENAME(@DatabaseName130) + N'.sys.database_principals AS database_role
+        ON database_role_members.role_principal_id = database_role.principal_id
+    INNER JOIN ' + QUOTENAME(@DatabaseName130) + N'.sys.database_principals AS member
+        ON database_role_members.member_principal_id = member.principal_id
+    WHERE database_role.name = ''db_owner''
+      AND member.name <> ''dbo'';';
+
+    INSERT INTO @Check130
+    EXEC sys.sp_executesql @Sql130;
+
+    FETCH NEXT FROM db_cursor_130 INTO @DatabaseName130, @DatabaseStateDesc130;
+END
+
+CLOSE db_cursor_130;
+DEALLOCATE db_cursor_130;
+
+SELECT
+      [Check ID]
+    , DatabaseName
+    , MemberName
+    , Principal_Type
+    , AdditionalInfo
+FROM @Check130
+ORDER BY
+      DatabaseName
+    , MemberName;
+
+GO
+
 DECLARE @Check129 TABLE
 (
       [Check ID]       varchar(10)
@@ -3031,6 +3215,7 @@ $AllowedCheckIds = @(
     '078'
     '123'
     '129'
+    '130'
     '155'
     '011'
     '015'
@@ -3051,29 +3236,30 @@ $Catalog = @(
     [pscustomobject]@{ 'Check ID' = '002'; SectionID = '6'; Section = 'Communication Security' },
     [pscustomobject]@{ 'Check ID' = '003'; SectionID = '6'; Section = 'Communication Security' },
     [pscustomobject]@{ 'Check ID' = '004'; SectionID = '6'; Section = 'Communication Security' },
-    [pscustomobject]@{ 'Check ID' = '006'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
-    [pscustomobject]@{ 'Check ID' = '008'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
-    [pscustomobject]@{ 'Check ID' = '010'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '006'; SectionID = '12'; Section = 'SQL Server Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '008'; SectionID = '12'; Section = 'SQL Server Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '010'; SectionID = '12'; Section = 'SQL Server Accounts security' },
     [pscustomobject]@{ 'Check ID' = '011'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
     [pscustomobject]@{ 'Check ID' = '015'; SectionID = '10'; Section = 'Server Privileges Analysis for Elevation-of-Privilege Risks' },
-    [pscustomobject]@{ 'Check ID' = '026'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '027'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '028'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '026'; SectionID = '13'; Section = 'Server Logins' },
+    [pscustomobject]@{ 'Check ID' = '027'; SectionID = '13'; Section = 'Server Logins' },
+    [pscustomobject]@{ 'Check ID' = '028'; SectionID = '14'; Section = 'Database Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '031'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '034'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '036'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '038'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '046'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '050'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
-    [pscustomobject]@{ 'Check ID' = '059'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
-    [pscustomobject]@{ 'Check ID' = '069'; SectionID = '15'; Section = 'Basic Security Audit Configuration Review' },
-    [pscustomobject]@{ 'Check ID' = '072'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '078'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '079'; SectionID = '12'; Section = 'SQL Server and Database Accounts security' },
-    [pscustomobject]@{ 'Check ID' = '113'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '123'; SectionID = '7'; Section = 'SQL Server Configuration Security' },
-    [pscustomobject]@{ 'Check ID' = '129'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
-    [pscustomobject]@{ 'Check ID' = '155'; SectionID = '13'; Section = 'Account dependencies and orphaned accounts' },
+    [pscustomobject]@{ 'Check ID' = '046'; SectionID = '13'; Section = 'Server Logins' },
+    [pscustomobject]@{ 'Check ID' = '050'; SectionID = '16'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '059'; SectionID = '16'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '069'; SectionID = '16'; Section = 'Basic Security Audit Configuration Review' },
+    [pscustomobject]@{ 'Check ID' = '072'; SectionID = '14'; Section = 'Database Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '078'; SectionID = '14'; Section = 'Database Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '079'; SectionID = '12'; Section = 'SQL Server Accounts security' },
+    [pscustomobject]@{ 'Check ID' = '113'; SectionID = '15'; Section = 'Database User Accounts' },
+    [pscustomobject]@{ 'Check ID' = '123'; SectionID = '14'; Section = 'Database Configuration Security' },
+    [pscustomobject]@{ 'Check ID' = '129'; SectionID = '15'; Section = 'Database User Accounts' },
+    [pscustomobject]@{ 'Check ID' = '130'; SectionID = '15'; Section = 'Database User Accounts' },
+    [pscustomobject]@{ 'Check ID' = '155'; SectionID = '14'; Section = 'Database Configuration Security' },
     [pscustomobject]@{ 'Check ID' = '800'; SectionID = '0'; Section = 'Information' },
     [pscustomobject]@{ 'Check ID' = '802'; SectionID = '0'; Section = 'Information' },
     [pscustomobject]@{ 'Check ID' = '806'; SectionID = '0'; Section = 'Information' }
@@ -3107,6 +3293,7 @@ $Rules = [ordered]@{
     '123' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
     '155' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
 	'129' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
+    '130' = @{ Method = 'rows_exist'; Severity = 'OBSERVE' } # Db_owner database role members
     '802' = @{ Method = 'static'; Severity = 'INFO'; MinMajorVersion = 16 } 
     '806' = @{ Method = 'rows_exist'; Severity = 'WARNING' } 
 }
@@ -3165,6 +3352,9 @@ The assessment identified databases with AUTO_CLOSE enabled. This setting can ne
     '129' = [pscustomobject]@{ CheckName = 'Orphaned Database Users'; Recommendation = @'
 The assessment identified orphaned database users without a corresponding login. Review and remove or remap these users to reduce administrative overhead and prevent confusion or unintended permission issues. Orphaned users can also introduce risks such as privilege takeover and non-repudiation by misusing their identities.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
+    '130' = [pscustomobject]@{ CheckName = 'Db_owner database role members'; LevelOfEffort = 'Low'; Recommendation = @'
+Review membership in db_owner and remove accounts that do not require full control over the database. For most users and applications, narrower role assignments such as db_datareader and db_datawriter are sufficient.
+'@.Trim(); ReferenceTitle = 'The SQL Server Database Application Security & High Availability Checklist by Sarpedon Quality Lab - Version 2'; ReferenceUrl = 'https://andreas-wolter.com/en/2026_sqlserverdatabaseapplicationsecurityandhighavailabilitychecklist_v2/'; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
     '155' = [pscustomobject]@{ CheckName = 'Database Owner not valid'; Recommendation = @'
 Some databases do not have a valid owner mapping between the metadata in the master database and the user database. This can occur after a restore when the original owner login does not exist on the target system, or when the owner login has been removed. Such mismatches can lead to unexpected behavior or code execution issues. Ensure that every database has a valid and existing owner. The owner can be set in SSMS under Database - Properties - Files, or by using the ALTER AUTHORIZATION statement.
 '@.Trim(); ReferenceTitle = ''; ReferenceUrl = ''; ReferenceTitle2 = ''; ReferenceUrl2 = '' }
@@ -3221,9 +3411,10 @@ h1{margin:0;color:#2c3e50;font-size:2rem;line-height:1.1;}
 .header-subtitle{font-size:.98rem;color:#6b7280;font-weight:500;}
 
 .exec-header-box{display:flex;flex-direction:column;gap:14px;margin-bottom:20px;}
-.meta-strip{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin:0;width:100%}
-.meta-box{background:#f8f9fb;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;min-width:0}
+.meta-strip{display:flex;flex-wrap:nowrap;gap:10px;margin:0;width:100%}
+.meta-box{background:#f8f9fb;border:1px solid #e7eaee;border-radius:10px;padding:10px 12px;min-width:0;flex:1 1 0}
 .meta-title{font-size:11px;text-transform:uppercase;color:#667085;margin-bottom:4px}
+.meta-title-sub{margin-top:8px;padding-top:8px;border-top:1px solid #e7eaee}
 .meta-value{font-size:14px;font-weight:600;color:#1f2937;word-break:break-word;overflow-wrap:anywhere}
 
 .visuals-panel,.controls,.detail-section,.category-summary-panel{background:white;box-shadow:0 2px 5px rgba(0,0,0,0.1);}
@@ -3243,6 +3434,18 @@ h1{margin:0;color:#2c3e50;font-size:2rem;line-height:1.1;}
 .chart-bar.outcome-WARNING{background:#ffc107;}
 .chart-bar.outcome-FAIL{background:#dc3545;}
 
+.visuals-panel-compact{padding:14px 16px;}
+.outcome-tiles{display:flex;flex-wrap:wrap;gap:10px;}
+.outcome-tile{display:flex;align-items:baseline;gap:10px;border:1px solid transparent;border-radius:8px;padding:10px 16px;color:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact;}
+.outcome-tile-label{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:inherit;}
+.outcome-tile-value{font-size:1.15rem;font-weight:700;color:inherit;}
+.outcome-tile-PASS{background:#28a745;border-color:#248a3d;}
+.outcome-tile-OBSERVE{background:#0ea5e9;border-color:#0b8ec9;}
+.outcome-tile-WARNING{background:#ffc107;border-color:#d9a406;color:#212529;}
+.outcome-tile-FAIL{background:#dc3545;border-color:#b92d3b;}
+.outcome-tile-INFO{background:#6b7280;border-color:#575d66;}
+.outcome-tile.outcome-tile-empty{background:#f4f5f7;border-color:#e0e3e8;color:#9aa1ab;}
+
 .controls{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:20px;padding:16px;}
 .controls-left,.controls-right{display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
 .controls-label{font-weight:600;color:#2c3e50;margin-right:2px;}
@@ -3250,9 +3453,15 @@ button{font:inherit;padding:10px 12px;border:1px solid #ccd3d9;border-radius:6px
 button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:not-allowed;}
 .filter-btn{font-weight:600;}
 .filter-btn.active{background:#2c3e50;color:#fff;border-color:#2c3e50;}
+.filter-btn.filter-btn-empty,.filter-btn:disabled{opacity:.45;cursor:not-allowed;}
+
+.notice-panel{background:#f0f7fc;border:1px solid #cfe3f2;border-left:5px solid #0ea5e9;border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:.92rem;color:#2c3e50;page-break-inside:avoid;break-inside:avoid;}
+.notice-link{color:#0b6fa4;font-weight:600;word-break:break-all;overflow-wrap:anywhere;}
 
 .category-summary-panel{padding:16px;margin-bottom:20px;page-break-inside:avoid;break-inside:avoid;}
 .category-summary-title{font-size:1rem;font-weight:700;color:#2c3e50;margin:0 0 12px 0;}
+.category-summary-title-plain{font-weight:400;}
+.category-summary-title-plain strong{font-weight:700;}
 .category-summary-table-wrap{overflow-x:auto;}
 .category-summary-table{width:100%;min-width:560px;border-collapse:collapse;}
 .category-summary-table th{background:#34495e;color:white;padding:8px;border:1px solid #ddd;text-align:left;}
@@ -3341,8 +3550,8 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 .footer-muted{display:block;}
 
 @media print {
-    body{background:#fff;margin:20px 24px;}
-    .page{min-height:auto;}
+    body{background:#fff;margin:20px 24px;padding-bottom:70px;}
+    .page{min-height:auto;padding-bottom:70px;}
     .visuals-panel,.controls,.detail-section,.category-summary-panel,.meta-box{box-shadow:none;}
     .visuals-panel{page-break-inside:avoid;break-inside:avoid;}
     .chart-bar,.chart-track,.footer-logo{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
@@ -3350,7 +3559,8 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 }
 
 @media (max-width: 900px){
-    .meta-strip{grid-template-columns:1fr 1fr;}
+    .meta-strip{flex-wrap:wrap;}
+    .meta-box{flex:1 1 calc(50% - 5px);}
     .report-footer-inner{grid-template-columns:1fr;gap:6px;}
     .footer-left,.footer-center,.footer-right{text-align:left;white-space:normal;}
 }
@@ -3367,68 +3577,31 @@ button.disabled-btn{background:#e2e5e8;color:#777;border-color:#e2e5e8;cursor:no
 <div class='report-header'>
     <div class='title-block'>
         <h1>SQL Server Security Assessment</h1>
-        <div class='header-subtitle'>Scope: High-Level Security Indicators (Community Edition) | Version: {RELEASE_VERSION}</div>
+        <div class='header-subtitle'>Scope: High-Level Security Indicators (Community Edition)<!--SCOPE_SUFFIX--> | Version: {RELEASE_VERSION}</div>
     </div>
 </div>
 
 <div class='exec-header-box'>
     <div class='meta-strip'>
-        <div class='meta-box'><div class='meta-title'>Core Security Controls</div><div class='meta-value'>{CHECK_COUNT}</div></div>
         <div class='meta-box'><div class='meta-title'>Sections Analyzed</div><div class='meta-value'>{SECTION_COUNT}</div></div>
+        <div class='meta-box'><div class='meta-title'>Core Security Controls</div><div class='meta-value'>{CHECK_COUNT}</div><!--INFO_ITEMS--></div>
         <div class='meta-box'><div class='meta-title'>Report Date</div><div class='meta-value'>{REPORT_DATE}</div></div>
         <div class='meta-box'><div class='meta-title'>Target Server</div><div class='meta-value'>{TARGET_SERVER}</div></div>
+        <!--DATABASE_META_BOX-->
     </div>
 </div>
 
-<div class="visuals-panel">
-    <div class="visuals-title">Outcome Distribution</div>
-    <div class="chart-row">
-        <div class="chart-bars">
-            <div class="chart-bar-wrap">
-                <div class="chart-track">
-                    <div class="chart-bar outcome-PASS" id="bar-pass" style="height:0%;">
-                        <div class="chart-bar-pct-inside" id="bar-pass-pct">0%</div>
-                    </div>
-                </div>
-                <div class="chart-label">PASS (<span id="bar-pass-value">0</span>)</div>
-            </div>
-            <div class="chart-bar-wrap">
-                <div class="chart-track">
-                    <div class="chart-bar outcome-OBSERVE" id="bar-observe" style="height:0%;">
-                        <div class="chart-bar-pct-inside" id="bar-observe-pct">0%</div>
-                    </div>
-                </div>
-                <div class="chart-label">OBSERVE (<span id="bar-observe-value">0</span>)</div>
-            </div>
-            <div class="chart-bar-wrap">
-                <div class="chart-track">
-                    <div class="chart-bar outcome-WARNING" id="bar-warning" style="height:0%;">
-                        <div class="chart-bar-pct-inside dark-text" id="bar-warning-pct">0%</div>
-                    </div>
-                </div>
-                <div class="chart-label">WARNING (<span id="bar-warning-value">0</span>)</div>
-            </div>
-            <div class="chart-bar-wrap">
-                <div class="chart-track">
-                    <div class="chart-bar outcome-FAIL" id="bar-fail" style="height:0%;">
-                        <div class="chart-bar-pct-inside" id="bar-fail-pct">0%</div>
-                    </div>
-                </div>
-                <div class="chart-label">FAIL (<span id="bar-fail-value">0</span>)</div>
-            </div>
-        </div>
-    </div>
-</div>
+<!--VISUALS_PANEL-->
 
 <div class="controls detail-controls">
     <div class="controls-left">
         <div class="controls-label">Filter results by Outcome</div>
-        <button class="filter-btn active" type="button" data-filter="ALL">All</button>
-        <button class="filter-btn" type="button" data-filter="PASS">PASS</button>
-        <button class="filter-btn" type="button" data-filter="OBSERVE">OBSERVE</button>
-        <button class="filter-btn" type="button" data-filter="WARNING">WARNING</button>
-        <button class="filter-btn" type="button" data-filter="FAIL">FAIL</button>
-        <button class="filter-btn" type="button" data-filter="INFO">INFO</button>
+        <button class="filter-btn active" type="button" data-filter="ALL" data-label="All">All</button>
+        <button class="filter-btn" type="button" data-filter="PASS" data-label="PASS">PASS</button>
+        <button class="filter-btn" type="button" data-filter="OBSERVE" data-label="OBSERVE">OBSERVE</button>
+        <button class="filter-btn" type="button" data-filter="WARNING" data-label="WARNING">WARNING</button>
+        <button class="filter-btn" type="button" data-filter="FAIL" data-label="FAIL">FAIL</button>
+        <button class="filter-btn" type="button" data-filter="INFO" data-label="INFO">INFO</button>
     </div>
     <div class="controls-right">
         <button id="expandAll" type="button">Expand All</button>
@@ -3498,13 +3671,26 @@ function setBar(id, count, maxCount){
     el.style.height = (count > 0 ? height : 0) + '%';
 }
 
-function updateVisuals(){
-    const order = ['PASS','OBSERVE','WARNING','FAIL'];
-    const counts = {PASS:0, OBSERVE:0, WARNING:0, FAIL:0};
+function outcomeCounts(){
+    const counts = {PASS:0, OBSERVE:0, WARNING:0, FAIL:0, INFO:0};
     sections.forEach(section => {
         const outcome = getOutcome(section);
         if (counts.hasOwnProperty(outcome)) counts[outcome] += 1;
     });
+    return counts;
+}
+
+function setTile(id, count){
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = count;
+    const tile = el.closest('.outcome-tile');
+    if (tile) tile.classList.toggle('outcome-tile-empty', count === 0);
+}
+
+function updateVisuals(){
+    const order = ['PASS','OBSERVE','WARNING','FAIL'];
+    const counts = outcomeCounts();
     const total = order.reduce((a, k) => a + counts[k], 0);
     const maxCount = Math.max(0, ...order.map(k => counts[k]));
 
@@ -3522,6 +3708,26 @@ function updateVisuals(){
     setBar('bar-observe', counts.OBSERVE, maxCount);
     setBar('bar-warning', counts.WARNING, maxCount);
     setBar('bar-fail', counts.FAIL, maxCount);
+
+    setTile('tile-pass-value', counts.PASS);
+    setTile('tile-observe-value', counts.OBSERVE);
+    setTile('tile-warning-value', counts.WARNING);
+    setTile('tile-fail-value', counts.FAIL);
+    setTile('tile-info-value', counts.INFO);
+}
+
+function updateFilterButtons(){
+    const counts = outcomeCounts();
+    const total = sections.length;
+    filterButtons.forEach(btn => {
+        const filter = (btn.getAttribute('data-filter') || 'ALL').toUpperCase();
+        const label = btn.getAttribute('data-label') || filter;
+        const count = filter === 'ALL' ? total : (counts[filter] || 0);
+        btn.textContent = label + ' (' + count + ')';
+        const empty = filter !== 'ALL' && count === 0;
+        btn.disabled = empty;
+        btn.classList.toggle('filter-btn-empty', empty);
+    });
 }
 
 function applyFilters(){
@@ -3566,6 +3772,7 @@ if (collapseBtn) {
 }
 
 updateVisuals();
+updateFilterButtons();
 applyFilters();
 updateButtons();
 });
@@ -3684,13 +3891,21 @@ catch {
                             <TextBlock Text="Compatibility:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
                             <CheckBox Name="SkipSecurityAdminChecks" Grid.Column="1" Content="Skip checks that require securityadmin-role membership" FontSize="11" VerticalAlignment="Center"/>
                         </Grid>
-                        <Grid>
+                        <Grid Margin="0,0,0,4">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="110"/>
                                 <ColumnDefinition Width="*"/>
                             </Grid.ColumnDefinitions>
                             <TextBlock Text="" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
                             <CheckBox Name="AwsRdsCompatChecks" Grid.Column="1" Content="AWS RDS Compat. Checks only" FontSize="11" VerticalAlignment="Center"/>
+                        </Grid>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="110"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="Reports:" FontSize="11" Foreground="#7F8C8D" VerticalAlignment="Center"/>
+                            <CheckBox Name="CreateIndividualDBLevelReportsCheck" Grid.Column="1" Content="Create additional per database reports" FontSize="11" VerticalAlignment="Center"/>
                         </Grid>
                     </StackPanel>
                 </Border>
@@ -3725,6 +3940,7 @@ $EncryptOption    = $Window.FindName('EncryptOption')
 $TrustCert        = $Window.FindName('TrustCert')
 $SkipSecurityAdminChecks = $Window.FindName('SkipSecurityAdminChecks')
 $AwsRdsCompatChecks = $Window.FindName('AwsRdsCompatChecks')
+$CreateIndividualDBLevelReportsCheck = $Window.FindName('CreateIndividualDBLevelReportsCheck')
 $ConnectBtn       = $Window.FindName('ConnectBtn')
 $CancelBtn        = $Window.FindName('CancelBtn')
 $TestBtn          = $Window.FindName('TestBtn')
@@ -3759,12 +3975,26 @@ $Window.Add_ContentRendered({
 
 # --- Button actions ---
 $ConnectBtn.Add_Click({
-    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks -CreateIndividualDBLevelReportsCheck $CreateIndividualDBLevelReportsCheck
     $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
 
     if ($validationMessage) {
         Show-UiMessage -Message $validationMessage -Kind Warning
         return
+    }
+
+    try {
+        $ConnectBtn.IsEnabled = $false
+        $ConnectBtn.Content = 'Testing...'
+        Test-SqlConnection -InputObject $dialogInput | Out-Null
+    }
+    catch {
+        Show-UiMessage -Message ("Connection failed. Correct the connection settings and try again.`n`n{0}" -f $_.Exception.Message) -Title 'Connection Failed' -Kind Error
+        return
+    }
+    finally {
+        $ConnectBtn.Content = 'Start Assessment'
+        $ConnectBtn.IsEnabled = $true
     }
 
     $script:SqlServer     = $dialogInput.SqlServer
@@ -3775,12 +4005,13 @@ $ConnectBtn.Add_Click({
     $script:TrustCert     = $dialogInput.TrustCert
     $script:SkipChecks    = @($dialogInput.SkipChecks)
     $script:AwsRdsCompat = [bool]$dialogInput.AwsRdsCompat
+    $script:CreateIndividualDBLevelReports = [bool]$dialogInput.CreateIndividualDBLevelReports
     $Window.DialogResult = $true
     $Window.Close()
 })
 
 $TestBtn.Add_Click({
-    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks
+    $dialogInput = Get-DialogInput -ServerInput $ServerInput -AuthDropdown $AuthDropdown -UsernameInput $UsernameInput -PasswordInput $PasswordInput -EncryptOption $EncryptOption -TrustCert $TrustCert -SkipSecurityAdminChecks $SkipSecurityAdminChecks -AwsRdsCompatChecks $AwsRdsCompatChecks -CreateIndividualDBLevelReportsCheck $CreateIndividualDBLevelReportsCheck
     $validationMessage = Test-DialogInput -InputObject $dialogInput -ForConnect
 
     if ($validationMessage) {
@@ -3860,6 +4091,7 @@ if ($ConsoleOnly) {
     $EncryptOption = $Encrypt
     $TrustCert     = $TrustServerCert.IsPresent
     $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $SkipChecks)
+    $CreateIndividualReports = [bool]$CreateIndividualDBLevelReports
 }
 else {
     Write-Log '--- Phase: Logon dialog ---'
@@ -3878,6 +4110,7 @@ else {
     $TrustCert     = [bool]$script:TrustCert
     $ActiveSkipChecks = @(Resolve-SkipChecks -RequestedSkipChecks $script:SkipChecks)
     $AwsRdsCompat = [bool]$script:AwsRdsCompat
+    $CreateIndividualReports = [bool]$script:CreateIndividualDBLevelReports
 }
 
 if ($AwsRdsCompat) {
@@ -3890,6 +4123,7 @@ Write-LogValue 'Authentication'    $AuthMethod
 Write-LogValue 'Encryption'        $EncryptOption
 Write-LogValue 'Trust server cert' $TrustCert
 Write-LogValue 'AWS RDS compat'    ([bool]$AwsRdsCompat)
+Write-LogValue 'Individual DB reports' ([bool]$CreateIndividualReports)
 if ($ActiveSkipChecks.Count -gt 0) {
     Write-LogValue 'Skipped checks' ($ActiveSkipChecks -join ', ')
 }
@@ -4166,7 +4400,10 @@ catch {
 
 # --- SUMMARY COUNTS / DETAILS REPORT ---
 Write-Log '--- Phase: Report generation ---'
-$TotalChecks = @(Get-ExecutiveData -Items $ProcessedData).Count
+# Core Security Controls counts only the checks that carry an assessed outcome; INFO items are
+# reported separately so the number agrees with the totals in the Outcome Distribution chart.
+$TotalChecks = @(Get-ActionableChecks -Items $ProcessedData).Count
+$InfoItemCount = @($ProcessedData | Where-Object { $_.Outcome -eq 'INFO' }).Count
 $Fails  = @($ProcessedData | Where-Object { $_.Outcome -eq 'FAIL' }).Count
 $Warns  = @($ProcessedData | Where-Object { $_.Outcome -eq 'WARNING' }).Count
 $Passes = @($ProcessedData | Where-Object { $_.Outcome -eq 'PASS' }).Count
@@ -4279,7 +4516,7 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
         $detailTable = Convert-DataRowsToHtmlTable -Rows $item.Rows
         $recommendationPanel = Get-RecommendationPanelHtml -Outcome $outcome -CheckId $item.CheckId -RecommendationLookup $RecommendationLookup -DetailRowCount @($item.Rows).Count
 
-        if ($outcome -eq 'PASS') {
+        if ($outcome -eq 'PASS' -and @($item.Rows).Count -eq 0) {
             $DetailBlocks += @"
 <section class='detail-section detail-section-static' data-check-id='$safeCheckId' data-outcome='$outcome'>
     <table class='compact-summary-table'>
@@ -4312,9 +4549,110 @@ foreach ($sectionGroup in $DetailSectionsGrouped) {
     }
 }
 
+# The server-level report gets the full Outcome Distribution chart; the per-database reports cover
+# only a handful of checks, so they get compact outcome tiles instead. Both are populated by the
+# same client-side updateVisuals().
+$FullOutcomeChartHtml = @'
+<div class="visuals-panel">
+    <div class="visuals-title">Outcome Distribution</div>
+    <div class="chart-row">
+        <div class="chart-bars">
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-PASS" id="bar-pass" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-pass-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">PASS (<span id="bar-pass-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-OBSERVE" id="bar-observe" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-observe-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">OBSERVE (<span id="bar-observe-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-WARNING" id="bar-warning" style="height:0%;">
+                        <div class="chart-bar-pct-inside dark-text" id="bar-warning-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">WARNING (<span id="bar-warning-value">0</span>)</div>
+            </div>
+            <div class="chart-bar-wrap">
+                <div class="chart-track">
+                    <div class="chart-bar outcome-FAIL" id="bar-fail" style="height:0%;">
+                        <div class="chart-bar-pct-inside" id="bar-fail-pct">0%</div>
+                    </div>
+                </div>
+                <div class="chart-label">FAIL (<span id="bar-fail-value">0</span>)</div>
+            </div>
+        </div>
+    </div>
+</div>
+'@
+
+$CompactOutcomeTilesHtml = @'
+<div class="visuals-panel visuals-panel-compact">
+    <div class="visuals-title">Outcome Summary</div>
+    <div class="outcome-tiles">
+        <div class="outcome-tile outcome-tile-PASS"><span class="outcome-tile-label">PASS</span><span class="outcome-tile-value" id="tile-pass-value">0</span></div>
+        <div class="outcome-tile outcome-tile-OBSERVE"><span class="outcome-tile-label">OBSERVE</span><span class="outcome-tile-value" id="tile-observe-value">0</span></div>
+        <div class="outcome-tile outcome-tile-WARNING"><span class="outcome-tile-label">WARNING</span><span class="outcome-tile-value" id="tile-warning-value">0</span></div>
+        <div class="outcome-tile outcome-tile-FAIL"><span class="outcome-tile-label">FAIL</span><span class="outcome-tile-value" id="tile-fail-value">0</span></div>
+    </div>
+</div>
+'@
+
+# The individual database-level reports are written after the server-level report, but their
+# target folder is resolved up front so the server-level report can link to it.
+$databaseNames = @()
+$databaseReportsFolder = $ResultsFolder
+$DatabaseReportsNoticeHtml = ''
+if ($CreateIndividualReports) {
+    $databaseNames = @(
+        foreach ($item in $ProcessedData) {
+            foreach ($row in @($item.Rows)) {
+                $rowDatabaseName = Get-RowDatabaseName -Row $row
+                if (-not [string]::IsNullOrWhiteSpace($rowDatabaseName)) {
+                    $rowDatabaseName
+                }
+            }
+        }
+    )
+    $databaseNames = @($databaseNames | Sort-Object -Unique)
+
+    if ($databaseNames.Count -gt 0) {
+        # Place all per-database reports in a dedicated sub-folder next to the main report,
+        # named "<ServerName>__<Datestamp_Timestamp>__DatabaseLevelReports".
+        $databaseReportsFolderName = "{0}__{1}__DatabaseLevelReports" -f $ReportServerName, $TimeStamp
+        $databaseReportsFolder = Join-Path $ResultsFolder $databaseReportsFolderName
+        if (-not (Test-Path -LiteralPath $databaseReportsFolder)) {
+            New-Item -ItemType Directory -Path $databaseReportsFolder -Force | Out-Null
+        }
+        Write-Log ("Database-level reports folder: {0}" -f $databaseReportsFolder)
+
+        $safeFolderUri  = [System.Net.WebUtility]::HtmlEncode(([uri]$databaseReportsFolder).AbsoluteUri)
+        $safeFolderName = [System.Net.WebUtility]::HtmlEncode([string]$databaseReportsFolderName)
+        $safeFolderPath = [System.Net.WebUtility]::HtmlEncode([string]$databaseReportsFolder)
+        $DatabaseReportsNoticeHtml = @"
+<section class='notice-panel' aria-label='Individual database-level reports'>
+    Individual database level reports created in folder <a class='notice-link' href="$safeFolderUri" title="$safeFolderPath">$safeFolderName</a>
+</section>
+"@
+    }
+}
+
 $DetailsHeaderHtml = ''
 $DetailsNavigationHtml = ''
-$DetailsBodyHtml = @($CategorySummaryHtml, ($DetailBlocks -join "`r`n")) -join "`r`n"
+$DetailsBodyHtml = @(
+    $DatabaseReportsNoticeHtml,
+    $CategorySummaryHtml,
+    ($DetailBlocks -join "`r`n")
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$DetailsBodyHtml = $DetailsBodyHtml -join "`r`n"
 
 $DetailsTemplateHtml = $EmbeddedDetailsTemplateHtml
 
@@ -4322,14 +4660,142 @@ $DetailsHtml = $DetailsTemplateHtml.Replace('<!--DETAIL_HEADER-->', $DetailsHead
 $DetailsHtml = $DetailsHtml.Replace('<!--DETAIL_NAVIGATION-->', $DetailsNavigationHtml)
 $DetailsHtml = $DetailsHtml.Replace('<!--DETAIL_BODY-->', $DetailsBodyHtml)
 $DetailsHtml = $DetailsHtml.Replace('{RELEASE_VERSION}', [string]$ReleaseVersion)
+$DetailsHtml = $DetailsHtml.Replace('<!--VISUALS_PANEL-->', $FullOutcomeChartHtml)
 $DetailsHtml = $DetailsHtml.Replace('{CHECK_COUNT}', [string]$TotalChecks)
+$DetailsHtml = $DetailsHtml.Replace('<!--INFO_ITEMS-->', ("<div class='meta-title meta-title-sub'>Informational Items</div><div class='meta-value'>{0}</div>" -f $InfoItemCount))
 $DetailsHtml = $DetailsHtml.Replace('{SECTION_COUNT}', [string]$DetailSectionCount)
 $DetailsHtml = $DetailsHtml.Replace('{REPORT_DATE}', [string]$ReportDateDisplay)
 $DetailsHtml = $DetailsHtml.Replace('{TARGET_SERVER}', [string]$ScopeDisplay)
+$DetailsHtml = $DetailsHtml.Replace('<!--DATABASE_META_BOX-->', '')
+$DetailsHtml = $DetailsHtml.Replace('<!--SCOPE_SUFFIX-->', '')
 $utf8WithBom = New-Object System.Text.UTF8Encoding($true)
 Write-Log "Writing HTML report to: $DetailsPath"
 [System.IO.File]::WriteAllText($DetailsPath, $DetailsHtml, $utf8WithBom)
 Write-Log "Report written successfully ($([Math]::Round((Get-Item $DetailsPath).Length / 1KB, 1)) KB)"
+
+if ($CreateIndividualReports) {
+    Write-Log '--- Phase: Individual database report generation ---'
+
+    # Database names and the output folder were resolved before the server-level report was written.
+    # Sections that belong in a database-scoped report (everything else is server-level).
+    $DatabaseReportSections = @('Database Configuration Security', 'Database User Accounts')
+
+    foreach ($databaseName in $databaseNames) {
+        # Every database-scope check is always represented for every database. When a
+        # check returned no rows for this database it means there is nothing to report,
+        # which is a PASS; checks that returned rows keep their assessed outcome.
+        $databaseProcessedData = @(
+            foreach ($item in $ProcessedData) {
+                if ($DatabaseReportSections -notcontains [string]$item.Section) { continue }
+
+                $matchingRows = @(
+                    foreach ($row in @($item.Rows)) {
+                        if ((Get-RowDatabaseName -Row $row) -eq $databaseName) {
+                            $row
+                        }
+                    }
+                )
+
+                $databaseOutcome = if ($matchingRows.Count -gt 0) { [string]$item.Outcome } else { 'PASS' }
+
+                [pscustomobject]@{
+                    CheckId      = $item.CheckId
+                    CheckName    = $item.CheckName
+                    Outcome      = $databaseOutcome
+                    Section      = $item.Section
+                    SectionID    = $item.SectionID
+                    Rows         = $matchingRows
+                    IsAwsManaged = $item.IsAwsManaged
+                }
+            }
+        )
+
+        if ($databaseProcessedData.Count -eq 0) { continue }
+
+        $databaseDetailSectionsGrouped = @(
+            $databaseProcessedData |
+            Group-Object Section |
+            Sort-Object { [int]($_.Group[0].SectionID) }, Name
+        )
+
+        $databaseDetailBlocks = @()
+        $safeDatabaseName = [System.Net.WebUtility]::HtmlEncode($databaseName)
+        $databaseDetailBlocks += "<section class='category-summary-panel'><div class='category-summary-title category-summary-title-plain'>Database-level findings for Database &quot;<strong>$safeDatabaseName</strong>&quot;</div></section>"
+
+        foreach ($sectionGroup in $databaseDetailSectionsGrouped) {
+            $sectionName = [string]$sectionGroup.Name
+            $sectionId = [string]$sectionGroup.Group[0].SectionID
+            $safeSectionName = [System.Net.WebUtility]::HtmlEncode($sectionName)
+            $safeSectionAnchor = 'detail-section-' + $sectionId
+            $databaseDetailBlocks += "<h2 class='section-heading' id='$safeSectionAnchor'>$safeSectionName</h2>"
+
+            foreach ($item in $sectionGroup.Group) {
+                $safeCheckId = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckId)
+                $safeCheckName = [System.Net.WebUtility]::HtmlEncode([string]$item.CheckName)
+                $managedLabelHtml = ''
+                if ($item.PSObject.Properties['IsAwsManaged'] -and [bool]$item.IsAwsManaged) {
+                    $managedLabelHtml = '<span class="managed-label managed-label-aws"><span class="managed-label-dot"></span>AWS managed</span>'
+                }
+                $outcome = [string]$item.Outcome
+                $outcomeBadge = Get-OutcomeBadgeHtml -Outcome $outcome
+                $detailTable = Convert-DataRowsToHtmlTable -Rows $item.Rows
+                $recommendationPanel = Get-RecommendationPanelHtml -Outcome $outcome -CheckId $item.CheckId -RecommendationLookup $RecommendationLookup -DetailRowCount @($item.Rows).Count
+
+                if ($outcome -eq 'PASS' -and @($item.Rows).Count -eq 0) {
+                    $databaseDetailBlocks += @"
+<section class='detail-section detail-section-static' data-check-id='$safeCheckId' data-outcome='$outcome'>
+    <table class='compact-summary-table'>
+        <tr>
+            <td class='summary-check-id'>($safeCheckId)</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
+            <td class='summary-check-outcome'>$outcomeBadge</td>
+        </tr>
+    </table>
+</section>
+"@
+                    continue
+                }
+
+                $databaseDetailBlocks += @"
+<section class='detail-section' data-check-id='$safeCheckId' data-outcome='$outcome'>
+    <table class='compact-summary-table'>
+        <tr>
+            <td class='summary-check-id'>($safeCheckId)</td>
+            <td class='summary-check-name'>$safeCheckName$managedLabelHtml</td>
+            <td class='summary-check-outcome'>$outcomeBadge</td>
+        </tr>
+    </table>
+    <div class='detail-content'>
+        $detailTable
+        $recommendationPanel
+    </div>
+</section>
+"@
+            }
+        }
+
+        $databaseReportName = ConvertTo-SafeReportFilePart -Value $databaseName
+        $databaseDetailsPath = Join-Path $databaseReportsFolder ("{0}_{1}_SQL_Security_Assessment_DBLevel_{2}.html" -f $ReportServerName, $databaseReportName, $TimeStamp)
+        $databaseMetaBoxHtml = "<div class='meta-box'><div class='meta-title'>Database</div><div class='meta-value'>{0}</div></div>" -f [System.Net.WebUtility]::HtmlEncode([string](Protect-HeaderValue $databaseName))
+        $databaseDetailsHtml = $EmbeddedDetailsTemplateHtml.Replace('<!--DETAIL_HEADER-->', '')
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--DETAIL_NAVIGATION-->', '')
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--DETAIL_BODY-->', ($databaseDetailBlocks -join "`r`n"))
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('{RELEASE_VERSION}', [string]$ReleaseVersion)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--VISUALS_PANEL-->', $CompactOutcomeTilesHtml)
+        # Database-scoped checks never carry an INFO outcome, so the header box omits that line.
+        $databaseActionableCount = @(Get-ActionableChecks -Items $databaseProcessedData).Count
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('{CHECK_COUNT}', [string]$databaseActionableCount)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--INFO_ITEMS-->', '')
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('{SECTION_COUNT}', [string]$databaseDetailSectionsGrouped.Count)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('{REPORT_DATE}', [string]$ReportDateDisplay)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('{TARGET_SERVER}', [string]$ScopeDisplay)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--DATABASE_META_BOX-->', $databaseMetaBoxHtml)
+        $databaseDetailsHtml = $databaseDetailsHtml.Replace('<!--SCOPE_SUFFIX-->', ', individual database-level report')
+
+        [System.IO.File]::WriteAllText($databaseDetailsPath, $databaseDetailsHtml, $utf8WithBom)
+        Write-Log ("Database report written: {0}" -f $databaseDetailsPath)
+    }
+}
 
 Write-Log ("Success! Assessment report created at: {0}" -f $DetailsPath) -Color Green -AlwaysShow
 

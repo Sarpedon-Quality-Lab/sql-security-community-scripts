@@ -1,5 +1,49 @@
 # Get-SqlSafe Community Edition — Changelog
 
+## 2026.5
+
+### Major Changes
+
+- Added individual database-level reports.
+  `-CreateIndividualDBLevelReports` and a matching GUI option additionally write one report per database. Each report contains only the database-scoped checks for that database and is written to a `<ServerName>__<Timestamp>__DatabaseLevelReports` sub-folder next to the main report. The server-level report contains a link to that folder.
+
+### Report Changes
+
+- Reworked the report header boxes.
+  `Sections Analyzed` now comes first, and the boxes stay on a single row. `Core Security Controls` and `Informational Items` are reported separately in one box, so the control count matches the totals shown in the outcome chart. Previously the control count and the chart counted different sets of checks.
+
+- Reorganized report sections so that server-scoped and database-scoped findings are separated.
+
+### Assessment and SQL Changes
+
+- Added Check `130` - `Db_owner database role members`.
+  The check enumerates members of the `db_owner` database role across all online databases, excluding `dbo`, and reports them as `OBSERVE` when rows are returned. Membership in `db_owner` grants full control over a database and can be abused to elevate permissions to server-level.
+
+- Corrected the version branch in the GUI connection and permission test.
+  The SQL Server 2022 permission set (`VIEW SERVER SECURITY STATE`, `VIEW ANY SECURITY DEFINITION`, `VIEW SERVER PERFORMANCE STATE`) was previously tested against SQL Server 2014 and newer, where those permissions do not exist. It is now tested on SQL Server 2022 and newer only, and SQL Server 2014-2019 is tested for `VIEW SERVER STATE` and `VIEW ANY DEFINITION`.
+
+- The permission test now also checks `CONNECT ANY DATABASE`, which Check `130` requires to enumerate role members across databases. The permission was already documented in the README grant examples.
+
+### Documentation Changes
+
+- Clarified `-TrustServerCert`.
+  The switch only takes effect together with `-Encrypt Mandatory`. With `-Encrypt Optional`, the default, the server certificate is not validated in the first place and the switch changes nothing, except against an instance with `ForceEncryption` enabled, where the server imposes encryption and validation applies regardless. The README now documents the encryption and certificate combinations.
+
+### Upgrade Notes
+
+- Replace the previous collector with the new `Get-SqlSafe.ps1` file.
+- No changes to required SQL Server permissions.
+- Reports produced by 2026.4 remain readable; the layout changes apply to newly generated reports only.
+
+### Compatibility Notes
+
+- Windows PowerShell 5.1 remains the expected runtime.
+- SQL Server 2016 or newer is recommended for least-privilege modern use.
+- SQL Server 2012 and 2014 require higher privileges for some checks.
+- Database-level reports contain the same findings as the main report, scoped to one database, and should be handled with the same confidentiality requirements.
+
+---
+
 ## 2026.4
 
 ### Major Changes
