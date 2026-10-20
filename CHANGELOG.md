@@ -1,4 +1,43 @@
-# Get-SqlSafe Community Edition — Changelog
+﻿# Get-SqlSafe Community Edition - Changelog
+
+## 2026.6
+
+Changes from 2026.5. Earlier public release history is preserved below.
+
+### Azure SQL Database
+
+- Added Azure SQL Database as a target, with Microsoft Entra Interactive and SQL authentication. Entra sign-in opens the system browser and supports MFA.
+- Kept Get-SqlSafe as a standalone script for SQL Server and Amazon RDS. Azure requires only one additional small, readable Get-SqlSafe.Azure.psm1 beside the same script.
+- The Microsoft `SqlServer` and `Az.Accounts` modules are prerequisites for Azure SQL Database with Microsoft Entra authentication. SQL authentication requires only `SqlServer`. The assessment does not install or update these modules; SQL Server/RDS loads neither prerequisite.
+- Enforced strict Azure connection encryption and certificate validation.
+- Inventory is limited to metadata visible to the current identity in master and may not establish complete logical-server coverage.
+- Added `Service managed`, `Not applicable`, and `Outside SQL visibility` labels to distinguish Azure-managed settings from conditions the assessment can evaluate directly. SQL metadata cannot establish the effective Azure auditing configuration. Check `002` identifies Microsoft Entra-only mode through `IsExternalAuthenticationOnly`. When SQL authentication remains enabled, SQL metadata alone cannot establish whether Microsoft Entra authentication is otherwise configured or used.
+
+### Connection Dialog and Permissions
+
+- Switched to SQL Server, AWS RDS and Azure SQL Database radio selectors instead of dropdown and target-specific authentication/compatibility behavior.
+- The limited Azure SQL Database permission test is available when administrator-dependent checks are explicitly skipped.
+- The test cannot conclusively establish whether the connected identity is a SQL server administrator or Microsoft Entra administrator.
+
+### Assessment and Recommendations
+
+- Added Check `030` - Instance-wide cross-database ownership chaining enabled. This check evaluates the instance-level configuration. The included catalog increases from 30 entries in 2026.5 to 31 in 2026.6; not every entry executes on every target.
+- Renamed 031 to Databases with cross database ownership setting active, placed it in Database Configuration Security, and revised its recommendation to review and remove database-level chaining unless explicitly required.
+- Renamed the authentication category to Identity and Authentication and grouped account dependencies/orphaned accounts under the updated category name, including 046 and 129.
+- Limited 015 individual-account findings to S/U/E principals on SQL Server/RDS and S/E on Azure.
+- For Check 004, when fewer than 10 eligible connections are observed, the check reports `WARNING` on SQL Server/RDS and `OBSERVE` on Azure SQL Database. The recommendation is to repeat the assessment during representative activity.
+- Added `DatabaseName` as the first results column for Check `113`, consistent with Check `130`.
+- Updated checklist references to The Database Application Vendor's SQL Server Security & High Availability Checklist to the new public Sarpedon Quality Lab hosted URL: https://sarpedonqualitylab.us/resources/database-application-vendor-sql-server-security-high-availability-checklist/.
+
+### Report Presentation and Fixes
+
+- Fixed zero-count outcome bars: no colored fill or percentage label is visible, including when all outcomes are zero. Grey tracks and count labels remain.
+
+### Packaging and Upgrade
+
+- One Get-SqlSafe.zip contains the script, optional Azure psm1, README, changelog and license. SQL Server/RDS users can omit or remove the psm1.
+- Replace the script and, for Azure, the optional module together. Use a fresh PowerShell process after updating files or prerequisite modules.
+- Microsoft modules must be installed separately for Azure; no external modules are required for SQL Server/RDS. Review metadata visibility and Not checked entries when comparing reports between releases.
 
 ## 2026.5
 
@@ -101,28 +140,28 @@
 
 ### Major Changes
 
-- Converted the assessment to a self-contained PowerShell script.  
+- Converted the assessment to a self-contained PowerShell script.
   The SQL assessment logic is now embedded in the PowerShell collector, so the public package no longer needs a separate `SqlSafe.sql` file.
 
-- Removed the `Invoke-Sqlcmd` / Microsoft `SqlServer` PowerShell module dependency.  
+- Removed the `Invoke-Sqlcmd` / Microsoft `SqlServer` PowerShell module dependency.
   SQL execution now uses .NET `System.Data.SqlClient`, reducing setup friction on clean systems and controlled enterprise endpoints.
 
-- Added command-line / console execution.  
+- Added command-line / console execution.
   The assessment can now run without the WPF logon dialog by supplying `-SqlInstance`. Console mode supports Windows and SQL authentication and helps with automation-friendly execution in controlled endpoint environments.
 
-- Added optional report launch control.  
+- Added optional report launch control.
   `-NoAutoOpenReport` prevents automatic browser launch after report creation, which is useful in EDR/XDR-controlled environments where automatic browser launches may be restricted or flagged.
 
-- Added optional execution logging.  
+- Added optional execution logging.
   `-WriteLog` / `-LogFile` writes diagnostic run output to a log file next to the generated report. `-Verbose` controls console verbosity separately.
 
-- Added alternate Windows credential execution.  
+- Added alternate Windows credential execution.
   `-WindowsCredential` can relaunch the assessment under another Windows account for Windows-authenticated assessments.
 
-- Added a combined GUI connection and permission test.  
+- Added a combined GUI connection and permission test.
   The GUI test button now verifies connectivity, shows the connected login, displays the SQL Server version, and reports key permission checks before the assessment starts.
 
-- Added explicit process exit codes.  
+- Added explicit process exit codes.
   The collector now distinguishes successful runs, startup/validation failures, and SQL connection/execution failures.
 
 ### Packaging and Dependency Changes
@@ -134,22 +173,22 @@
 
 ### Assessment and SQL Changes
 
-- Added Check `800` - `System Overview`.  
+- Added Check `800` - `System Overview`.
   The report now includes contextual instance metadata such as version, edition, uptime, availability group counts, database count, login count, and active connections.
 
-- Added Check `011` - `Server role membership with direct Elevation-of-Privilege Risk`.  
+- Added Check `011` - `Server role membership with direct Elevation-of-Privilege Risk`.
   This highlights server role memberships that can directly lead to privilege escalation risk.
 
-- Updated Check `004` - `NTLM Authentication usage`.  
+- Updated Check `004` - `NTLM Authentication usage`.
   NTLM usage is now evaluated with staged severity:
   - Greater than `0%`: `OBSERVE`
   - `10%` to `30%`: `WARNING`
   - Greater than `30%`: `FAIL`
 
-- Updated Check `015` naming.  
+- Updated Check `015` naming.
   The check is now labeled `Powerful server role membership individual accounts` to better describe the finding.
 
-- Improved Check `026` filtering.  
+- Improved Check `026` filtering.
   Default/service-account and selected built-in permission rows are excluded before outcome evaluation, including selected `DENY` rows.
 
 - Fixed a bug in Check `050` which reported the wrong number of error logs in some environments.
@@ -166,12 +205,12 @@
 
 ### Operational Changes
 
-- Added early log file initialization when logging is enabled.  
+- Added early log file initialization when logging is enabled.
   Startup, validation, relaunch, and SQL execution messages can now be captured in the run log.
 
 - Added redaction protections for credentials and sensitive header values.
 
-- Improved SQL login handling.  
+- Improved SQL login handling.
   SQL authentication uses `SqlCredential` and `SecureString` instead of embedding SQL passwords into connection strings.
 
 ### Acknowledgements

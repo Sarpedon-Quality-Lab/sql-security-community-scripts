@@ -1,7 +1,7 @@
-# Get-SqlSafe.ps1: The Sarpedon SQL Server Security Community Assessment
+﻿# Get-SqlSafe Community Edition - SQL Server Security Assessment
 
-**Logic & Engine by Andreas Wolter (MCSM)**  
-Version 2026.5
+**Logic & Engine by Andreas Wolter (MCSM)**
+Version 2026.6
 
 Get-SqlSafe Community Edition is a standalone PowerShell-based SQL Server security assessment collector. It gathers selected high-level security indicators from a SQL Server instance and generates a local HTML report for review and remediation discussions.
 
@@ -23,129 +23,104 @@ This Community Edition is designed to:
 - Output a clean, visual local HTML report.
 - Be transparent and easy to review as plain-text PowerShell with embedded T-SQL.
 - Avoid automatic dependency installation.
-- Run without the Microsoft `SqlServer` PowerShell module or `Invoke-Sqlcmd`.
+- Run SQL Server and Amazon RDS assessments without external PowerShell modules. Azure SQL Database uses one optional module and separately installed Microsoft prerequisites.
 - Support both GUI-based and console-based execution.
-- Support selected checks against SQL Server on Amazon RDS through an explicit compatibility mode.
+- Support selected checks against SQL Server on Amazon RDS through an explicit compatibility mode, and Azure SQL Database through an optional component.
 
-<img width="1287" height="1092" alt="Get-SqlSafe Community Edition security assessment report" src="https://github.com/user-attachments/assets/a645177a-a70b-45b7-8c81-7d6a8e0a5524" />
 
 ---
 
-## What Changed in 2026.5
+## What Changed in 2026.6
 
-Version 2026.5 builds on 2026.4 and adds:
+Version 2026.6 builds on the previous public release, 2026.5.
 
-- Individual database-level reports through `-CreateIndividualDBLevelReports` and the GUI checkbox. Each report covers the database-scoped checks for one database and is written to a `<ServerName>__<Timestamp>__DatabaseLevelReports` sub-folder next to the main report, which also links to that folder.
-- New included Check `130` - `Db_owner database role members`, which reports members of the `db_owner` database role across all online databases.
-  
-<img width="554" height="415" alt="V5LogonDialogueWithPerDatabaseReportOption" src="https://github.com/user-attachments/assets/b8fa7df4-c890-4715-a5aa-d53e9f80f014" />
+- Added Azure SQL Database with browser-based Microsoft Entra sign-in/MFA and SQL authentication. The standalone script remains sufficient for SQL Server and Amazon RDS.
+- Added an optional PowerShell module, `Get-SqlSafe.Azure.psm1`, which is loaded only for Azure SQL Database assessments. It uses installed Microsoft modules and contains no embedded binary bundle or custom dependency cache.
+- Added three target selectors: SQL Server, AWS RDS and Azure SQL Database, with platform-specific authentication, encryption and compatibility options.
+- Added Check `030` for instance-wide cross-database ownership chaining.
+- Added database names as the first result column for Check `113`, matching Check `130`.
+- Improved report counts, skipped-check presentation, printing and filtering. Zero-count outcomes now have no colored bar fill.
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
+See [CHANGELOG.md](CHANGELOG.md) for the 2026.6 changes and the preserved history of earlier public releases.
 
----
+## Earlier Releases
 
-## What Changed in 2026.4
-
-Version 2026.4 builds on the self-contained 2026.3 collector and adds:
-
-- AWS RDS compatibility mode through `-AwsRdsCompat` and the GUI checkbox.
-- `AWS managed` labels for selected findings where SQL Server behavior may be controlled by AWS.
-- Check `006` for SQL logins without password policy enforcement.
-- Improved contained availability group reporting in Check `802`, including listener DNS/port details and guidance about the separate contained availability group security context.
-- Improved availability group handling.
-- A category summary table in the HTML report.
-- A report legend explaining the result labels.
-
-<img width="576" height="419" alt="Connection Dialogue with AWS compatibility mode" src="https://github.com/user-attachments/assets/f75c5418-8708-4a10-b4da-64df193f6a12" />
-
-
-See [`CHANGELOG.md`](CHANGELOG.md) for the complete public changelog summary.
-
----
+2026.5 introduced individual database reports and Check `130` for `db_owner` role members. 2026.4 added AWS RDS compatibility and other report and assessment improvements. Their history is retained in [CHANGELOG.md](CHANGELOG.md).
 
 ## Contents
 
-The public Community Edition package contains:
-
-- `Get-SqlSafe.ps1` — standalone PowerShell collector, embedded SQL assessment logic, and report generator
-- `README.md` — usage documentation
-- `CHANGELOG.md` — public release history
-- `LICENSE.md` — Sarpedon Community License
-
-Generated reports and logs are written to:
+There is one 2026.6 download, `Get-SqlSafe.zip`, containing:
 
 ```text
-.\Results
-.\Results\<ServerName>__<Timestamp>__DatabaseLevelReports   (only with -CreateIndividualDBLevelReports)
+Get-SqlSafe.ps1
+Get-SqlSafe.Azure.psm1
+README.md
+CHANGELOG.md
+LICENSE.md
 ```
 
-The public package does not require a separate SQL file.
+`Get-SqlSafe.ps1` is the same script for all targets. SQL Server and Amazon RDS users can omit or delete `Get-SqlSafe.Azure.psm1`. They do not need the Microsoft Azure prerequisites.
 
----
+Only Azure SQL Database needs the optional module beside the script and the Microsoft modules listed below. The optional module is plain PowerShell code, with no bundled DLLs, separate SQL file or Get-SqlSafe dependency cache. If it is missing when Azure is selected, the script reports the missing optional component. Reports and optional logs are written beneath `Results` next to the script. Keep the script and optional module from the same release together.
 
 ## Requirements
 
-- Windows PowerShell 5.1
-- Windows operating system with .NET Framework support
-- Network access to the target SQL Server instance
-- SQL Server 2016 or newer recommended
-- Permissions sufficient to read the assessed security metadata
+- Windows PowerShell 5.1 on Windows.
+- Network access to the database target and permissions to read the assessed metadata.
+- SQL Server 2016 or newer is recommended for SQL Server/RDS. SQL Server 2012 and 2014 may require broader permissions for selected checks.
+- SQL Server and Amazon RDS use .NET `System.Data.SqlClient` and require no external PowerShell modules.
+- Azure SQL Database requires .NET Framework 4.7.2 or later and the Microsoft `SqlServer` module, version 22.4.5.1 or later. Microsoft Entra authentication additionally requires `Az.Accounts`, version 5.3.4 or later.
 
-SQL Server 2012 and SQL Server 2014 may work for selected scenarios, but older versions can require higher privileges for some checks.
+Install the Azure prerequisites once as the account that runs the assessment:
 
-No PowerShell module installation is required for SQL execution. The collector uses .NET `System.Data.SqlClient`.
+```powershell
+Install-Module SqlServer -MinimumVersion 22.4.5.1 -Scope CurrentUser
+Install-Module Az.Accounts -MinimumVersion 5.3.4 -Scope CurrentUser
+```
 
----
+Use `-RequiredVersion` instead of `-MinimumVersion` to install those exact versions. For Azure SQL Database, SQL authentication requires the Microsoft `SqlServer` module but not `Az.Accounts`. The collector never installs or updates modules automatically. An administrator can provision them offline where PowerShell Gallery access is restricted.
+
+Neither Microsoft module is imported for SQL Server or Amazon RDS. For Azure, the optional component uses the driver supplied by `SqlServer`; `Az.Accounts` handles browser-based sign-in/MFA and SQL access tokens. Microsoft modules maintain their own dependencies and authentication state. No Get-SqlSafe-specific library download, cache or compiled helper is used.
 
 ## Supported Targets and Known Limitations
 
-Get-SqlSafe Community Edition currently supports SQL Server on-premises, SQL Server running in a virtual machine, and selected assessment scenarios for SQL Server on Amazon RDS. Use Windows or SQL authentication as supported by the target platform.
+Supported targets are SQL Server on-premises or in a virtual machine, SQL Server on Amazon RDS, and Azure SQL Database. Azure SQL Managed Instance is not an Azure SQL Database target in this release.
 
-For SQL Server on Amazon RDS, explicitly enable `-AwsRdsCompat` or select the corresponding GUI option. This mode adjusts or skips selected checks where AWS controls the underlying SQL Server behavior or restricts access to required metadata.
+Use Windows or SQL authentication for SQL Server/RDS. Use SQL authentication or Microsoft Entra Interactive for Azure SQL Database. Azure Entra sign-in opens the system browser and supports MFA. Complete sign-in in the browser, then return to PowerShell.
 
-Microsoft Entra authentication scenarios are not currently supported. In current SQL Server versions, Entra-authenticated sessions can expose the session authentication scheme as `NTLM`, which does not accurately describe the authentication protocol. Because Get-SqlSafe uses SQL Server authentication-scheme metadata for NTLM/Kerberos interpretation, authentication-related findings may be misleading for Entra-authenticated sessions.
+For RDS, select AWS RDS in the dialog or supply `-Platform AwsRds`. For Azure, use the optional module and select Azure SQL Database or supply `-Platform AzureSQLDatabase`.
+In GUI mode, Azure SQL Database assessments target databases discoverable through `master` by the connected identity. Console mode also supports an explicit database. A visible database inventory is not a guarantee that every database on the logical server is listed or accessible.
 
-Contained availability group metadata is available only when the target SQL Server version exposes the required catalog views. Security-context-dependent checks may need to be run through the contained availability group connection context for complete results.
+Some SQL Server checks do not apply to Azure SQL Database and are omitted entirely. Other Azure entries describe service-managed behavior or settings outside SQL metadata visibility. Checks `003`, `004` and `015` are not executed when the indirect administrator-visibility probe is negative or unavailable. The probe does not deterministically establish Server admin or Microsoft Entra administrator status. Verify administrator status and service-level configuration through the Azure control plane; the collector does not read that configuration.
 
----
+On SQL Server/RDS, authentication-scheme metadata can be misleading for Microsoft Entra-authenticated sessions. Azure SQL Database support does not extend Microsoft Entra authentication support to SQL Server instances or Azure SQL Managed Instance.
+
+Contained availability group metadata requires the relevant SQL Server catalog views. Checks affected by a contained availability group's separate security context may require assessment through that connection context.
 
 ## Quick Start - GUI Mode
 
-1. Download the repository or release package.
-2. Open Windows PowerShell.
-3. Unblock the script if it was downloaded from the internet:
+1. Extract the selected package and open Windows PowerShell. For Azure, install the prerequisites listed above.
+2. If required by your organization's download-handling process, unblock the files:
 
    ```powershell
    Unblock-File .\Get-SqlSafe.ps1
+   # Only when using Azure SQL Database:
+   Unblock-File .\Get-SqlSafe.Azure.psm1
    ```
 
-4. Run the assessment:
+3. Run the script:
 
    ```powershell
    .\Get-SqlSafe.ps1
    ```
 
-5. Enter the SQL Server name or instance.
-6. Select Windows or SQL authentication.
-7. Choose the encryption options required by the target.
-8. Enable AWS RDS compatibility mode when assessing SQL Server on Amazon RDS.
-9. Optionally enable additional per-database reports.
-10. Optionally test the connection and permissions.
-11. Start the assessment.
+4. Select SQL Server, AWS RDS or Azure SQL Database and enter the server name.
+5. Choose an authentication method supported by that target. Azure Entra sign-in uses the browser when a connection is opened.
+6. Review encryption and compatibility settings in Advanced. The securityadmin skip option applies to SQL Server/RDS; the Server admin or Entra administrator skip option applies to Azure and skips Checks `004` and `015`.
+7. Optionally request per-database reports or use Test Connection and Permissions. On Azure, select the administrator-check skip option to enable that limited permission test.
+8. Start the assessment.
 
-The generated HTML report is written to the `Results` subfolder and opens automatically unless report launch is disabled.
-
-<img width="500" height="402" alt="Get-SqlSafe connection and permission test" src="https://github.com/user-attachments/assets/90918bd2-e522-41de-a078-a4b6974556a5" />
-
-If your system blocks script execution, you may run the script with an explicit execution policy for this PowerShell process:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Get-SqlSafe.ps1
-```
-
-This permits the script to run in that PowerShell process. It does not unblock files permanently and does not install dependencies.
-
----
+The HTML report opens automatically unless `-NoAutoOpenReport` is supplied. Azure does not show an additional completion popup after writing the report. A failed authentication or assessment still reports the failure.
 
 ## Quick Start - Console Mode
 
@@ -166,8 +141,8 @@ Run without opening the report automatically:
 SQL authentication:
 
 ```powershell
-$pwd = Read-Host "SQL password" -AsSecureString
-.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd -NoAutoOpenReport
+$sqlPassword = Read-Host "SQL password" -AsSecureString
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $sqlPassword -NoAutoOpenReport
 ```
 
 Mandatory encryption while trusting the server certificate:
@@ -179,7 +154,7 @@ Mandatory encryption while trusting the server certificate:
 AWS RDS compatibility mode:
 
 ```powershell
-.\Get-SqlSafe.ps1 -SqlInstance "my-rds-instance.example.rds.amazonaws.com" -AwsRdsCompat -Encrypt Mandatory -TrustServerCert
+.\Get-SqlSafe.ps1 -SqlInstance "my-rds-instance.example.rds.amazonaws.com" -Platform AwsRds -Encrypt Mandatory -TrustServerCert
 ```
 
 Write a run log:
@@ -192,29 +167,50 @@ Console mode and `-NoAutoOpenReport` are useful for controlled endpoints, automa
 
 ---
 
+### Azure SQL Database with Microsoft Entra Interactive
+
+```powershell
+.\Get-SqlSafe.ps1 -Platform AzureSQLDatabase -Auth EntraInteractive -SqlInstance 'contoso.database.windows.net' -AzureAllVisibleDatabases -NoAutoOpenReport
+```
+
+For a single database, replace `-AzureAllVisibleDatabases` with `-AzureDatabase 'appdb'`. Entra authentication remains interactive even in console mode, so complete the browser sign-in/MFA.
+
+### Azure SQL Database with SQL Authentication
+
+```powershell
+$password = Read-Host 'Azure SQL password' -AsSecureString
+.\Get-SqlSafe.ps1 -Platform AzureSQLDatabase -Auth SQL -SqlUser 'SecurityAssessment' -SqlPass $password -SqlInstance 'contoso.database.windows.net' -AzureDatabase 'appdb' -NoAutoOpenReport
+```
+
+Azure connections always enforce `Encrypt=Strict` with certificate validation, regardless of the non-Azure default encryption setting. `-TrustServerCert` cannot weaken the Azure connection.
+
 ## Parameters
 
 | Parameter | Purpose |
 | --- | --- |
-| `-SqlInstance` | Target SQL Server name or instance. Supplying this parameter enables console mode. |
-| `-ConsoleOnly` | Runs without the WPF dialog. Aliases: `-NoUI`, `-NonInteractive`. |
-| `-Auth` | Authentication method: `Windows` or `SQL`. Defaults to `Windows`. |
-| `-SqlUser` | SQL login name. Required when `-Auth SQL` is used. |
-| `-SqlPass` | SQL login password as a `SecureString`. If omitted for SQL authentication, the script prompts interactively. |
-| `-Encrypt` | Connection encryption mode: `Optional` or `Mandatory`. Defaults to `Optional`. |
-| `-TrustServerCert` | Trusts the SQL Server certificate without certificate-chain validation. Only takes effect together with `-Encrypt Mandatory`; see [Connection Encryption](#connection-encryption). |
-| `-CreateIndividualDBLevelReports` | Additionally writes one report per database into a sub-folder next to the main report. |
-| `-AwsRdsCompat` | Enables AWS RDS compatibility behavior and `AWS managed` labels. |
-| `-WindowsCredential` | Relaunches the assessment under another Windows account. Valid with Windows authentication and requires `-SqlInstance`. |
-| `-WriteLog` | Writes run output to a log file in the `Results` folder. Alias: `-LogFile`. |
-| `-Verbose` | Shows verbose progress output in the console independently of `-WriteLog`. |
-| `-NoAutoOpenReport` | Prevents the generated HTML report from opening automatically. |
+| `-SqlInstance` | Target SQL Server instance or Azure SQL logical server. Supplying it enables console mode. |
+| `-ConsoleOnly` | Runs without the WPF dialog. Aliases: `-NoUI`, `-NonInteractive`. Entra sign-in still requires interaction. |
+| `-Platform` | `SQLServer` (default), `AwsRds`, or `AzureSQLDatabase`. |
+| `-Auth` | `Windows` (default for SQL Server/RDS), `SQL`, or `EntraInteractive` (default for Azure SQL Database). EntraInteractive requires Azure SQL Database. |
+| `-SqlUser` | SQL login name, required for SQL authentication. |
+| `-SqlPass` | SQL login password as a SecureString. SQL Server/RDS prompts if omitted. Azure SQL authentication requires an explicit `-SqlPass`; omission stops execution. |
+| `-AzureDatabase` | Explicit Azure database to assess. |
+| `-AzureAllVisibleDatabases` | Assess the Azure databases visible to this identity in master. Do not combine with `-AzureDatabase`. |
+| `-Encrypt` | `Optional`, `Mandatory` or `Strict`. Optional is the SQL Server/RDS default; Azure always enforces Strict. Strict requires Azure. |
+| `-TrustServerCert` | SQL Server/RDS certificate-trust option. Azure always validates its certificate. |
+| `-SkipChecks` | Explicit check IDs to skip, such as `-SkipChecks 046` or `-SkipChecks 004,015`. Skipped entries are shown as Not checked. |
+| `-CreateIndividualDBLevelReports` | Additionally write reports containing database-scoped checks for individual databases. |
+| `-AwsRdsCompat` | Backwards compatibility only: Use -Platform AwsRds instead. Enable AWS RDS compatibility behavior and AWS managed labels. |
+| `-WindowsCredential` | Relaunch under another Windows account. Requires Windows authentication and `-SqlInstance`. |
+| `-WriteLog` | Write a run log under Results. Alias: `-LogFile`. |
+| `-Verbose` | Show verbose progress independently of file logging. |
+| `-NoAutoOpenReport` | Write reports without launching the browser to display them. |
 
----
+Use `Get-Help .\Get-SqlSafe.ps1 -Full` for script help. The Azure component contains the Azure-specific queries and connection handling.
 
 ## Connection Encryption
 
-`-Encrypt` and `-TrustServerCert` work together, and the second only means something in combination with the first:
+For SQL Server and Amazon RDS, `-Encrypt` and `-TrustServerCert` work together:
 
 | Encryption | Trust certificate | Result |
 | --- | --- | --- |
@@ -222,13 +218,15 @@ Console mode and `-NoAutoOpenReport` are useful for controlled endpoints, automa
 | `Mandatory` | off | The session is encrypted and the certificate is validated: the chain must be trusted, the certificate unexpired, and its name must match the server name as typed. A stock instance using its auto-generated self-signed certificate will fail this. |
 | `Mandatory` | on | The session is encrypted, but any certificate is accepted. This protects against passive interception, not against an active man-in-the-middle. |
 
-The login packet, including the password when `-Auth SQL` is used, is encrypted during the TDS pre-login handshake regardless of these settings. `Optional` means the rest of the session — the queries and all result rows — is unencrypted and no certificate is verified.
+The login packet, including the password when `-Auth SQL` is used, is encrypted during the TDS pre-login handshake regardless of these settings. `Optional` means the rest of the session - the queries and all result rows - is unencrypted and no certificate is verified.
 
 One exception to the first row: if the instance has `ForceEncryption` enabled, the server imposes encryption even when `Optional` was requested, and certificate validation then applies. That is the usual reason an `Optional` connection unexpectedly fails on certificate trust.
 
 For an assessment run across an untrusted network, prefer `-Encrypt Mandatory` with a properly issued certificate and without `-TrustServerCert`.
 
 ---
+
+Azure SQL Database always uses Strict encryption with certificate validation. Its connection ignores the non-Azure Optional default and does not permit TrustServerCertificate to weaken validation.
 
 ## Authentication Modes
 
@@ -254,15 +252,15 @@ $cred = Get-Credential
 Use SQL authentication with a secure password prompt:
 
 ```powershell
-$pwd = Read-Host "SQL password" -AsSecureString
-.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $pwd
+$sqlPassword = Read-Host "SQL password" -AsSecureString
+.\Get-SqlSafe.ps1 -SqlInstance "SQLPROD01" -Auth SQL -SqlUser "assessment_user" -SqlPass $sqlPassword
 ```
 
 ---
 
 ## AWS RDS Compatibility Mode
 
-Use `-AwsRdsCompat` when assessing SQL Server on Amazon RDS.
+Use `-Platform AwsRds` when assessing SQL Server on Amazon RDS.
 
 When enabled, the collector:
 
@@ -338,6 +336,18 @@ The script includes a connection and permission test in the GUI. The test checks
 
 ---
 
+## Azure SQL Database Permissions
+
+For the broadest available assessment coverage, use a Microsoft Entra administrator or the SQL server administrator. For limited coverage, use an assessment account with the following server-role memberships:
+
+```sql
+ALTER SERVER ROLE ##MS_DatabaseConnector## ADD MEMBER [SecurityAssessment];
+ALTER SERVER ROLE ##MS_SecurityDefinitionReader## ADD MEMBER [SecurityAssessment];
+ALTER SERVER ROLE ##MS_ServerSecurityStateReader## ADD MEMBER [SecurityAssessment];
+ALTER SERVER ROLE ##MS_ServerPerformanceStateReader## ADD MEMBER [SecurityAssessment];
+```
+
+
 ## Checks and Report Content
 
 The assessment covers high-level indicators across areas such as:
@@ -373,7 +383,7 @@ When per-database reports are requested, each database additionally receives its
 
 ## Result Meanings
 
-The report uses five outcome states:
+The report uses five outcome states and a separate Not checked display for skipped checks:
 
 | Outcome | Meaning |
 | --- | --- |
@@ -382,10 +392,18 @@ The report uses five outcome states:
 | `OBSERVE` | Marks a condition that is not necessarily risky by itself but should be reviewed or monitored. Impact depends on environment, intent, and compensating controls. |
 | `WARNING` | Indicates a security-relevant finding that should be reviewed and usually remediated, but does not by itself indicate immediate high risk. |
 | `FAIL` | Indicates a clear security risk that requires prompt attention. |
+| `Not checked` | The included check was skipped. Grey, with no PASS/failure assignment or expandable findings. |
 
 For `OBSERVE`, `WARNING`, and `FAIL` findings, the report includes recommendation text and, where available, reference links.
 
 ---
+
+
+A query failure or missing evidence is not a PASS. Azure reports may indicate that a check was not assessed or only partially assessed when required evidence is unavailable. Successful PASS entries show only the heading and outcome, with no empty results panel.
+
+For Check `004`, fewer than ten eligible connections produces WARNING on SQL Server/RDS and OBSERVE on Azure, with only the recommendation to repeat the scan during representative activity. With at least ten connections, SQL Server/RDS uses the NTLM percentage rules and Kerberos guidance. Azure uses Entra guidance and changes the SQL Server FAIL outcome to OBSERVE because visible NTLM connections can be associated with Azure services and features. Connection samples reflect observed metadata, not guaranteed complete server coverage.
+
+Zero-count outcomes retain their count and grey chart track but have no colored fill or percentage label. Print output includes collapsed evidence and recommendations; Expand All and Collapse All operate on the currently visible expandable sections.
 
 ## Output, Security, and Data Handling
 
@@ -404,7 +422,7 @@ Generated reports and logs may include sensitive environment-specific informatio
 
 Handle generated reports according to your organization's data handling and confidentiality requirements.
 
-The collector does not intentionally change SQL Server configuration or data. It reads metadata and reports high-level indicators.
+The assessment does not modify SQL Server or database configuration or user data. Azure Entra authentication selects browser login only for the current PowerShell process. It reads metadata and reports high-level indicators.
 
 ---
 
@@ -424,8 +442,8 @@ The required hash changes whenever the embedded SQL text changes, including its 
 
 ```text
 0 = completed successfully
-2 = startup, parameter, credential, or assessment source validation failure
-3 = SQL connection or SQL execution failure
+2 = startup, parameter, credential, assessment source validation failure, or some Azure connection/authentication exceptions
+3 = SQL connection or execution failure, including Azure assessments that produce no publishable report
 ```
 
 ---
@@ -439,13 +457,13 @@ This tool is distributed as a plain-text PowerShell script so organizations can 
 Get-SqlSafe Community Edition:
 
 - Runs locally from the extracted folder.
-- Connects to SQL Server using Windows or SQL authentication.
+- Connects to SQL Server/RDS using Windows or SQL authentication, or Azure SQL Database using SQL authentication or browser-based Microsoft Entra authentication.
 - Executes embedded SQL assessment logic.
 - Validates the embedded SQL text using SHA-256 before execution.
 - Writes a local HTML report to the `Results` folder.
 - Can optionally write a run log to the `Results` folder.
 - Does not install PowerShell modules automatically.
-- Does not intentionally modify SQL Server configuration or data as part of the assessment.
+- Does not modify SQL Server or database configuration or user data.
 
 ### Recommended Enterprise Process
 
@@ -498,6 +516,14 @@ A clean report means that the covered baseline indicators did not identify findi
 Some checks may require permissions that are not available on older SQL Server versions or managed platforms without elevated access. Use the report as a starting point for deeper review and remediation planning.
 
 ---
+
+## Upgrade from 2026.5
+
+1. Replace the old script with the 2026.6 `Get-SqlSafe.ps1` and use the updated README, changelog and license. SQL Server and RDS still require only the standalone script at runtime.
+2. For Azure SQL Database, put `Get-SqlSafe.Azure.psm1` beside the script and install the Microsoft prerequisites described above.
+3. Use a fresh PowerShell process after replacing the script, optional component or Microsoft modules. Already loaded .NET assemblies cannot be replaced inside the existing process.
+4. Review the new Check `030`, the database categorization of `031`, and the changed treatment of skipped checks. A Not checked entry is not a PASS.
+5. Validate the new release on a non-production target before broader use.
 
 ## Upgrade Notes from 2026.4
 
