@@ -11,6 +11,8 @@ The Community Edition is designed as a practical first look at SQL Server securi
 
 Read the [original public introduction to Get-SqlSafe Community Edition](https://andreas-wolter.com/en/2605_get-sqlsafe_communityedition_sqlserver_security_asssessment_tool/).
 
+![Get-SqlSafe HTML report overview with outcome distribution chart, outcome filters and checks by category](images/report-overview.png)
+
 ---
 
 ## What This Tool Does
@@ -93,6 +95,8 @@ In GUI mode, Azure SQL Database assessments target databases discoverable throug
 
 Some SQL Server checks do not apply to Azure SQL Database and are omitted entirely. Other Azure entries describe service-managed behavior or settings outside SQL metadata visibility. Checks `003`, `004` and `015` are not executed when the indirect administrator-visibility probe is negative or unavailable. The probe does not deterministically establish Server admin or Microsoft Entra administrator status. Verify administrator status and service-level configuration through the Azure control plane; the collector does not read that configuration.
 
+![Azure SQL Database report entries labeled Service managed and Not applicable](images/report-azure-labels.png)
+
 On SQL Server/RDS, authentication-scheme metadata can be misleading for Microsoft Entra-authenticated sessions. Azure SQL Database support does not extend Microsoft Entra authentication support to SQL Server instances or Azure SQL Managed Instance.
 
 Contained availability group metadata requires the relevant SQL Server catalog views. Checks affected by a contained availability group's separate security context may require assessment through that connection context.
@@ -115,6 +119,9 @@ Contained availability group metadata requires the relevant SQL Server catalog v
    ```
 
 4. Select SQL Server, AWS RDS or Azure SQL Database and enter the server name.
+
+   ![Connection dialog with the SQL Server, AWS RDS and Azure SQL Database target selector and Microsoft Entra Interactive authentication](images/gui-target-selection.png)
+
 5. Choose an authentication method supported by that target. Azure Entra sign-in uses the browser when a connection is opened.
 6. Review encryption and compatibility settings in Advanced. The securityadmin skip option applies to SQL Server/RDS; the Server admin or Entra administrator skip option applies to Azure and skips Checks `004` and `015`.
 7. Optionally request per-database reports or use Test Connection and Permissions. On Azure, select the administrator-check skip option to enable that limited permission test.
@@ -334,6 +341,8 @@ SQL Server 2012 has fewer granular metadata visibility options. Review this requ
 
 The script includes a connection and permission test in the GUI. The test checks the permission set that applies to the detected SQL Server version. In console mode, missing permissions are typically discovered during SQL execution.
 
+![Test Connection and Permissions result listing each required permission as passed](images/gui-permission-test.png)
+
 ---
 
 ## Azure SQL Database Permissions
@@ -376,6 +385,8 @@ The HTML report includes:
 - Detailed findings grouped by category
 - Recommendations and references for actionable findings
 - Informational context for version and system overview checks
+
+![Expanded FAIL finding for NTLM authentication usage with result data, recommendation and reference link](images/report-finding-detail.png)
 
 When per-database reports are requested, each database additionally receives its own report containing the database-scoped checks for that database, with a compact outcome summary in place of the distribution chart.
 
