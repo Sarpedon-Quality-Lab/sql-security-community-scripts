@@ -1,9 +1,9 @@
-﻿# Get-SqlSafe Community Edition - SQL Server Security Assessment
+﻿# Get-SqlSafe: Free SQL Server Security Check and Assessment Script (Community Edition)
 
-**Logic & Engine by Andreas Wolter (MCSM)**
+**By [Andreas Wolter](https://andreas-wolter.com/en/), former Microsoft Senior Program Manager for SQL Server security and one of 7 Microsoft Certified Solutions Masters (MCSM): Data Platform. Sarpedon Quality Lab.**
 Version 2026.6
 
-Get-SqlSafe Community Edition is a standalone PowerShell-based SQL Server security assessment collector. It gathers selected high-level security indicators from a SQL Server instance and generates a local HTML report for review and remediation discussions.
+Get-SqlSafe Community Edition is a free SQL Server security check: a standalone PowerShell script that runs 27 core checks and writes a local HTML report for review and remediation discussions. It is read-only: it does not modify SQL Server or database configuration or user data. It works with SQL Server, SQL Server on Amazon RDS and Azure SQL Database.
 
 The Community Edition is designed as a practical first look at SQL Server security posture. It focuses on baseline indicators such as authentication exposure, auditing gaps, excessive privileges, risky configuration settings, orphaned or dependent accounts, and database ownership drift.
 
@@ -359,7 +359,22 @@ ALTER SERVER ROLE ##MS_ServerPerformanceStateReader## ADD MEMBER [SecurityAssess
 
 ## Checks and Report Content
 
-The assessment covers high-level indicators across areas such as:
+### Common questions it answers
+
+| Question | Check |
+|---|---|
+| Who is a member of the sysadmin role? | `010` Sysadmin members, individual accounts |
+| Is `xp_cmdshell` enabled? | `034` xp_cmdshell setting |
+| Are there orphaned database users? | `129` Orphaned database users |
+| Are there orphaned Windows logins? | `046` Orphaned Windows logins |
+| Is the `sa` login renamed and disabled? | `008` SA login name, `079` SA login state |
+| Which databases have `TRUSTWORTHY` set? | `028` Databases with TRUSTWORTHY |
+| Which SQL logins skip the password policy? | `006` SQL logins without password policy enforcement |
+| Is SQL authentication or NTLM still in use? | `003` SQL authentication usage, `004` NTLM authentication usage |
+| Who is `db_owner` in each database? | `130` db_owner database role members |
+| Are failed logins logged, and is SQL Server Audit set up? | `069` Login failure logging, `059` SQL Server Audit minimal setup |
+
+### All areas covered
 
 - Authentication configuration
 - SQL authentication, password-policy enforcement, and NTLM usage
@@ -369,7 +384,7 @@ The assessment covers high-level indicators across areas such as:
 - Powerful features such as `xp_cmdshell`, ad hoc distributed queries, and OLE Automation
 - Orphaned Windows logins and database users
 - `db_owner` database role membership
-- SQL Server security audit configuration
+- SQL Server Audit configuration
 - Database ownership risks
 - SQL Server error log retention
 - Availability groups and contained availability groups
@@ -568,11 +583,13 @@ The full **Sarpedon SQL Server Security Assessment** can include advanced archit
 
 [Explore full-scope SQL Server security assessments at Sarpedon Quality Lab](https://sarpedonqualitylab.us/sql-server-security-assessment/).
 
+Prefer to work through it yourself first? Use the free [SQL Server Security and High Availability Checklist](https://sarpedonqualitylab.us/resources/database-application-vendor-sql-server-security-high-availability-checklist/). For ongoing visibility into who changes what, see [SQL Server Auditing & Activity Monitoring](https://sarpedonqualitylab.us/services/#audit).
+
 ---
 
 ## License and Attribution
 
-Logic & Engine by Andreas Wolter (MCSM), Sarpedon Quality Lab.
+Logic & Engine by Andreas Wolter, former Microsoft Senior Program Manager for SQL Server security (MCSM: Data Platform), Sarpedon Quality Lab.
 
 This project is distributed under the Sarpedon Community License. Use is permitted for internal business or personal purposes. Unmodified generated reports may be shared provided that all branding, attribution, Community Edition designation, and version information remain intact. Redistribution of modified scripts or reports is governed by the license terms.
 
