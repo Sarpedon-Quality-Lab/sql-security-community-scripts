@@ -1,6 +1,6 @@
 ﻿# Get-SqlSafe: Free SQL Server Security Check and Assessment Script (Community Edition)
 
-**By [Andreas Wolter](https://andreas-wolter.com/en/), former Microsoft Senior Program Manager for SQL Server security and one of 7 Microsoft Certified Solutions Masters (MCSM): Data Platform. Sarpedon Quality Lab.**
+**By [Andreas Wolter](https://andreas-wolter.com/en/), former Microsoft Senior Program Manager for SQL Server security and one of 7 Microsoft Certified Solutions Masters (MCSM): Data Platform. [Sarpedon Quality Lab](https://sarpedonqualitylab.us/).**
 Version 2026.6
 
 Get-SqlSafe Community Edition is a free SQL Server security check: a standalone PowerShell script that runs 27 core checks and writes a local HTML report for review and remediation discussions. It is read-only: it does not modify SQL Server or database configuration or user data. It works with SQL Server, SQL Server on Amazon RDS and Azure SQL Database.
@@ -8,6 +8,8 @@ Get-SqlSafe Community Edition is a free SQL Server security check: a standalone 
 The Community Edition is designed as a practical first look at SQL Server security posture. It focuses on baseline indicators such as authentication exposure, auditing gaps, excessive privileges, risky configuration settings, orphaned or dependent accounts, and database ownership drift.
 
 > **Note:** This tool identifies indicators of risk. It is not a full security audit, penetration test, compliance assessment, or guarantee of security.
+
+Need more than a first look? The full [Sarpedon SQL Server Security Assessment](https://sarpedonqualitylab.us/sql-server-security-assessment/) covers about 90 to more than 140 checks, reviewed by a former Microsoft Senior Program Manager for SQL Server security.
 
 Read the [original public introduction to Get-SqlSafe Community Edition](https://andreas-wolter.com/en/2605_get-sqlsafe_communityedition_sqlserver_security_asssessment_tool/).
 
