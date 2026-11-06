@@ -11,6 +11,8 @@ The Community Edition is designed as a practical first look at SQL Server securi
 
 Need more than a first look? The full [Sarpedon SQL Server Security Assessment](https://sarpedonqualitylab.us/sql-server-security-assessment/) covers about 90 to more than 140 checks, reviewed by a former Microsoft Senior Program Manager for SQL Server security.
 
+Overview, FAQ and what the full assessment adds: [Free SQL Server Security Check (Get-SqlSafe)](https://sarpedonqualitylab.us/free-sql-server-security-check/).
+
 Read the [original public introduction to Get-SqlSafe Community Edition](https://andreas-wolter.com/en/2605_get-sqlsafe_communityedition_sqlserver_security_asssessment_tool/).
 
 ![Get-SqlSafe HTML report overview with outcome distribution chart, outcome filters and checks by category](images/report-overview.png)
